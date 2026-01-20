@@ -48,7 +48,12 @@
       "Bash(bash:*)",
       "Bash(test:*)",
       "Bash(Remove-Item -Recurse -Force \"c:\\\\Users\\\\user\\\\Desktop\\\\MPC-WALLET\\\\p2p-comm\\\\.git\")",
-      "Bash(Remove-Item -Recurse -Force \"c:\\\\Users\\\\user\\\\Desktop\\\\MPC-WALLET\\\\torcus-wallet\\\\.git\")"
+      "Bash(Remove-Item -Recurse -Force \"c:\\\\Users\\\\user\\\\Desktop\\\\MPC-WALLET\\\\torcus-wallet\\\\.git\")",
+      "Bash(git rm:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git reset:*)"
     ]
   }
 }
