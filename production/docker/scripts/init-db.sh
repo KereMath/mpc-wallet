@@ -48,9 +48,9 @@ PGPASSWORD="${POSTGRES_PASSWORD}" psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB}"
         RETURN QUERY
         SELECT
             COUNT(*)::BIGINT as total_transactions,
-            COUNT(*) FILTER (WHERE state = 'pending')::BIGINT as pending_transactions,
-            COUNT(*) FILTER (WHERE state = 'confirmed')::BIGINT as confirmed_transactions,
-            COUNT(*) FILTER (WHERE state = 'failed')::BIGINT as failed_transactions,
+            COUNT(*) FILTER (WHERE state::TEXT = 'pending')::BIGINT as pending_transactions,
+            COUNT(*) FILTER (WHERE state::TEXT = 'confirmed')::BIGINT as confirmed_transactions,
+            COUNT(*) FILTER (WHERE state::TEXT = 'failed')::BIGINT as failed_transactions,
             AVG(completed_at - created_at) FILTER (WHERE completed_at IS NOT NULL) as avg_confirmation_time
         FROM transactions;
     END;

@@ -112,8 +112,9 @@ services:
       - PGDATA=/var/lib/postgresql/data/pgdata
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ../scripts/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
-      - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/02-init.sh:ro
+      - ./init-db/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./init-db/02_migrations.sql:/docker-entrypoint-initdb.d/02_migrations.sql:ro
+      - ./init-db/03_triggers.sql:/docker-entrypoint-initdb.d/03_triggers.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mpc} -d ${POSTGRES_DB:-mpc_wallet}"]
       interval: 10s
@@ -165,6 +166,8 @@ services:
       - ESPLORA_URL=${ESPLORA_URL:-https://blockstream.info/testnet/api}
       - RUST_LOG=${RUST_LOG:-info}
       - RUST_BACKTRACE=1
+      - ENABLE_ORCHESTRATION=${ENABLE_ORCHESTRATION:-true}
+      - NODE_ENDPOINTS=1=http://mpc-node-1:8080;2=http://mpc-node-2:8080;3=http://mpc-node-3:8080;4=http://mpc-node-4:8080;5=http://mpc-node-5:8080
     volumes:
       - ${CERTS_PATH:?CERTS_PATH must be set}:/certs:ro
       - node-1-data:/data
@@ -221,6 +224,8 @@ services:
       - ESPLORA_URL=${ESPLORA_URL:-https://blockstream.info/testnet/api}
       - RUST_LOG=${RUST_LOG:-info}
       - RUST_BACKTRACE=1
+      - ENABLE_ORCHESTRATION=${ENABLE_ORCHESTRATION:-true}
+      - NODE_ENDPOINTS=1=http://mpc-node-1:8080;2=http://mpc-node-2:8080;3=http://mpc-node-3:8080;4=http://mpc-node-4:8080;5=http://mpc-node-5:8080
     volumes:
       - ${CERTS_PATH:?CERTS_PATH must be set}:/certs:ro
       - node-2-data:/data
@@ -277,6 +282,8 @@ services:
       - ESPLORA_URL=${ESPLORA_URL:-https://blockstream.info/testnet/api}
       - RUST_LOG=${RUST_LOG:-info}
       - RUST_BACKTRACE=1
+      - ENABLE_ORCHESTRATION=${ENABLE_ORCHESTRATION:-true}
+      - NODE_ENDPOINTS=1=http://mpc-node-1:8080;2=http://mpc-node-2:8080;3=http://mpc-node-3:8080;4=http://mpc-node-4:8080;5=http://mpc-node-5:8080
     volumes:
       - ${CERTS_PATH:?CERTS_PATH must be set}:/certs:ro
       - node-3-data:/data
@@ -333,6 +340,8 @@ services:
       - ESPLORA_URL=${ESPLORA_URL:-https://blockstream.info/testnet/api}
       - RUST_LOG=${RUST_LOG:-info}
       - RUST_BACKTRACE=1
+      - ENABLE_ORCHESTRATION=${ENABLE_ORCHESTRATION:-true}
+      - NODE_ENDPOINTS=1=http://mpc-node-1:8080;2=http://mpc-node-2:8080;3=http://mpc-node-3:8080;4=http://mpc-node-4:8080;5=http://mpc-node-5:8080
     volumes:
       - ${CERTS_PATH:?CERTS_PATH must be set}:/certs:ro
       - node-4-data:/data
@@ -389,6 +398,8 @@ services:
       - ESPLORA_URL=${ESPLORA_URL:-https://blockstream.info/testnet/api}
       - RUST_LOG=${RUST_LOG:-info}
       - RUST_BACKTRACE=1
+      - ENABLE_ORCHESTRATION=${ENABLE_ORCHESTRATION:-true}
+      - NODE_ENDPOINTS=1=http://mpc-node-1:8080;2=http://mpc-node-2:8080;3=http://mpc-node-3:8080;4=http://mpc-node-4:8080;5=http://mpc-node-5:8080
     volumes:
       - ${CERTS_PATH:?CERTS_PATH must be set}:/certs:ro
       - node-5-data:/data

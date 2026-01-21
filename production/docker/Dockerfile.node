@@ -27,6 +27,7 @@ COPY crates/security/Cargo.toml ./crates/security/
 COPY crates/consensus/Cargo.toml ./crates/consensus/
 COPY crates/protocols/Cargo.toml ./crates/protocols/
 COPY crates/bitcoin/Cargo.toml ./crates/bitcoin/
+COPY crates/orchestrator/Cargo.toml ./crates/orchestrator/
 COPY crates/api/Cargo.toml ./crates/api/
 COPY crates/cli/Cargo.toml ./crates/cli/
 
@@ -34,10 +35,10 @@ COPY crates/cli/Cargo.toml ./crates/cli/
 RUN mkdir -p crates/types/src crates/common/src crates/crypto/src \
     crates/storage/src crates/network/src crates/security/src \
     crates/consensus/src crates/protocols/src crates/bitcoin/src \
-    crates/api/src crates/api/src/bin crates/cli/src && \
+    crates/orchestrator/src crates/api/src crates/api/src/bin crates/cli/src && \
     echo "fn main() {}" > crates/api/src/bin/server.rs && \
     echo "fn main() {}" > crates/cli/src/main.rs && \
-    for dir in types common crypto storage network security consensus protocols bitcoin; do \
+    for dir in types common crypto storage network security consensus protocols bitcoin orchestrator; do \
         echo "pub fn dummy() {}" > crates/$dir/src/lib.rs; \
     done && \
     echo "pub fn dummy() {}" > crates/api/src/lib.rs
