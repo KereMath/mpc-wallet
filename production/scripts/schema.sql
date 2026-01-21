@@ -9,13 +9,17 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE TYPE transaction_state AS ENUM (
     'pending',
     'voting',
+    'collecting',
+    'threshold_reached',
     'approved',
     'rejected',
     'signing',
     'signed',
+    'submitted',
     'broadcasting',
     'confirmed',
-    'failed'
+    'failed',
+    'aborted_byzantine'
 );
 
 -- Byzantine violation types enum
