@@ -222,7 +222,7 @@ impl PostgresStorage {
                 &[
                     &tx.txid.0,
                     &state_str,
-                    &tx.unsigned_tx,
+                    &tx.unsigned_tx.as_slice(),
                     &tx.recipient,
                     &(tx.amount_sats as i64),
                     &(tx.fee_sats as i64),
