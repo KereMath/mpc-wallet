@@ -25,6 +25,11 @@ threshold-types = { path = "../types" }
 threshold-bitcoin = { path = "../bitcoin" }
 threshold-storage = { path = "../storage" }
 threshold-consensus = { path = "../consensus" }
+protocols = { path = "../protocols" }
+threshold-orchestrator = { path = "../orchestrator" }
+
+# TLS/QUIC support
+rustls = { version = "0.23", features = ["aws_lc_rs"], default-features = false }
 
 # Error handling
 thiserror.workspace = true
@@ -39,6 +44,7 @@ chrono.workspace = true
 uuid.workspace = true
 hex.workspace = true
 sha2.workspace = true
+ed25519-dalek.workspace = true
 
 # Metrics
 prometheus = { version = "0.13", features = ["process"] }

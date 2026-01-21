@@ -1,13 +1,24 @@
 //! Transaction management endpoints
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Json,
 };
 use serde::{Deserialize, Serialize};
 use threshold_types::{TransactionState, TxId};
 
 use crate::{error::ApiError, state::AppState, ApiResult};
+
+/// Query parameters for listing transactions
+#[derive(Debug, Deserialize)]
+pub struct ListTransactionsQuery {
+    /// Maximum number of transactions to return (default: 100)
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Number of transactions to skip (default: 0)
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
 
 /// Request to create a new transaction
 #[derive(Debug, Serialize, Deserialize)]
@@ -136,12 +147,18 @@ pub async fn get_transaction(
 /// GET /api/v1/transactions - List all transactions
 ///
 /// Returns a list of all transactions with their current status
+/// Supports pagination via query parameters: ?limit=N&offset=M
 pub async fn list_transactions(
     State(state): State<AppState>,
+    Query(query): Query<ListTransactionsQuery>,
 ) -> ApiResult<Json<ListTransactionsResponse>> {
-    // Fetch all transactions from database
-    let transactions = crate::handlers::transactions::list_transactions(state.postgres.as_ref())
-        .await?;
+    // Fetch transactions from database with pagination
+    let transactions = crate::handlers::transactions::list_transactions(
+        state.postgres.as_ref(),
+        query.limit,
+        query.offset,
+    )
+    .await?;
 
     let total = transactions.len();
     let transaction_responses: Vec<TransactionStatusResponse> = transactions

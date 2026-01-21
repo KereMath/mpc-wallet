@@ -234,6 +234,7 @@ pub struct VotingRound {
     pub completed: bool,
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+    pub timeout_at: DateTime<Utc>,
 }
 
 /// Consensus result when threshold is reached

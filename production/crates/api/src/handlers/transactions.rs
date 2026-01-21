@@ -150,15 +150,17 @@ pub async fn create_transaction(
 
 /// List all transactions from the database
 pub async fn list_transactions(
-    _postgres: &PostgresStorage,
+    postgres: &PostgresStorage,
+    limit: Option<usize>,
+    offset: Option<usize>,
 ) -> Result<Vec<Transaction>, ApiError> {
-    // In production, this would support pagination and filtering
-    // For now, we'll return a simple implementation
+    info!(
+        "Listing transactions (limit: {:?}, offset: {:?})",
+        limit, offset
+    );
 
-    info!("Listing all transactions");
-
-    // Since PostgresStorage doesn't have a list_all method yet,
-    // we'll return an empty list for now
-    // In production, you would implement a proper query
-    Ok(vec![])
+    postgres
+        .list_all_transactions(limit, offset)
+        .await
+        .map_err(|e| ApiError::InternalError(e.to_string()))
 }

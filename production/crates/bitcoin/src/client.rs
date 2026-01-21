@@ -308,6 +308,28 @@ impl BitcoinClient {
             address.to_string()
         }
     }
+
+    /// Broadcast a transaction (wrapper for broadcast_tx that takes &[u8] instead of &str).
+    pub async fn broadcast_transaction(&self, tx_bytes: &[u8]) -> Result<String, BitcoinError> {
+        // Convert bytes to hex string
+        let tx_hex = hex::encode(tx_bytes);
+        self.broadcast_tx(&tx_hex).await
+    }
+
+    /// Get transaction confirmations (wrapper for get_tx_confirmation that returns u32).
+    /// Returns 0 if not confirmed, otherwise the number of confirmations.
+    pub async fn get_transaction_confirmations(&self, txid: &str) -> Result<u32, BitcoinError> {
+        match self.get_tx_confirmation(txid).await? {
+            Some(block_height) => {
+                // Get current height
+                let current_height = self.get_block_height().await?;
+                // Calculate confirmations
+                let confirmations = current_height.saturating_sub(block_height) + 1;
+                Ok(confirmations as u32)
+            }
+            None => Ok(0), // Not confirmed yet
+        }
+    }
 }
 
 #[cfg(test)]

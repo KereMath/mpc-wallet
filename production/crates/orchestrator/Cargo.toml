@@ -1,0 +1,38 @@
+[package]
+name = "threshold-orchestrator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.38", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Time utilities
+chrono = { version = "0.4", features = ["serde"] }
+
+# HTTP client for health checks
+reqwest = { version = "0.12", features = ["json"] }
+
+# Internal dependencies
+threshold-storage = { path = "../storage" }
+threshold-consensus = { path = "../consensus" }
+protocols = { path = "../protocols" }
+threshold-bitcoin = { path = "../bitcoin" }
+threshold-types = { path = "../types" }
+
+[dev-dependencies]
+mockall = "0.12"
+tempfile = "3.10"

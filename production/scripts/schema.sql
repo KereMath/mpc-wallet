@@ -5,22 +5,8 @@
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- Transaction states enum
-CREATE TYPE transaction_state AS ENUM (
-    'pending',
-    'voting',
-    'collecting',
-    'threshold_reached',
-    'approved',
-    'rejected',
-    'signing',
-    'signed',
-    'submitted',
-    'broadcasting',
-    'confirmed',
-    'failed',
-    'aborted_byzantine'
-);
+-- Transaction states are now stored as TEXT with CHECK constraint
+-- No enum type needed, more flexible for future state additions
 
 -- Byzantine violation types enum
 CREATE TYPE violation_type AS ENUM (
@@ -34,7 +20,7 @@ CREATE TYPE violation_type AS ENUM (
 CREATE TABLE IF NOT EXISTS transactions (
     id BIGSERIAL PRIMARY KEY,
     txid TEXT NOT NULL UNIQUE,
-    state transaction_state NOT NULL DEFAULT 'pending',
+    state TEXT NOT NULL DEFAULT 'pending',
     unsigned_tx BYTEA NOT NULL,
     signed_tx BYTEA,
     recipient TEXT NOT NULL,
@@ -47,6 +33,13 @@ CREATE TABLE IF NOT EXISTS transactions (
     completed_at TIMESTAMPTZ,
     bitcoin_txid TEXT,
     confirmations INTEGER DEFAULT 0,
+    CONSTRAINT transactions_state_check CHECK (
+        state IN (
+            'pending', 'voting', 'collecting', 'threshold_reached', 'approved',
+            'rejected', 'signing', 'signed', 'submitted', 'broadcasting',
+            'confirmed', 'failed', 'aborted_byzantine'
+        )
+    ),
     CONSTRAINT valid_state_transition CHECK (
         (state = 'pending' AND signed_tx IS NULL) OR
         (state IN ('signing', 'signed', 'broadcasting', 'confirmed') AND signed_tx IS NOT NULL) OR

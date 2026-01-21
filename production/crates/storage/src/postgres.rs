@@ -18,7 +18,8 @@ impl PostgresStorage {
         let mut cfg = Config::new();
         cfg.host = pg_config.get_hosts().first().and_then(|h| match h {
             tokio_postgres::config::Host::Tcp(s) => Some(s.clone()),
-            tokio_postgres::config::Host::Unix(_) => None, // Unix sockets not supported for deadpool
+            #[allow(unreachable_patterns)]
+            _ => None, // Unix sockets or other host types not supported for deadpool
         });
         cfg.port = pg_config.get_ports().first().copied();
         cfg.dbname = pg_config.get_dbname().map(|s| s.to_string());
@@ -216,14 +217,14 @@ impl PostgresStorage {
             .query_one(
                 r#"
                 INSERT INTO transactions (txid, state, unsigned_tx, recipient, amount_sats, fee_sats, metadata)
-                VALUES ($1, CAST($2 AS transaction_state), $3, $4, $5, $6, $7)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING id
                 "#,
                 &[
-                    &tx.txid.0,
-                    &state_str,
-                    &tx.unsigned_tx.as_slice(),
-                    &tx.recipient,
+                    &tx.txid.0.as_str(),
+                    &state_str.as_str(),
+                    &tx.unsigned_tx,
+                    &tx.recipient.as_str(),
                     &(tx.amount_sats as i64),
                     &(tx.fee_sats as i64),
                     &tx.metadata,
@@ -255,7 +256,7 @@ impl PostgresStorage {
             .execute(
                 r#"
                 UPDATE transactions
-                SET state = CAST($1 AS transaction_state), updated_at = NOW()
+                SET state = $1, updated_at = NOW()
                 WHERE txid = $2
                 "#,
                 &[&state_str, &txid.0],
@@ -280,7 +281,7 @@ impl PostgresStorage {
             .execute(
                 r#"
                 UPDATE transactions
-                SET signed_tx = $1, state = 'signed', updated_at = NOW()
+                SET signed_tx = $1, updated_at = NOW()
                 WHERE txid = $2
                 "#,
                 &[&signed_tx, &txid.0],
@@ -331,6 +332,62 @@ impl PostgresStorage {
         }))
     }
 
+    /// List all transactions with optional pagination
+    pub async fn list_all_transactions(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<Vec<Transaction>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::StorageError(format!("Failed to get client: {}", e)))?;
+
+        let limit_val = limit.unwrap_or(100) as i64;
+        let offset_val = offset.unwrap_or(0) as i64;
+
+        let rows = client
+            .query(
+                r#"
+                SELECT id, txid, state, unsigned_tx, signed_tx, recipient,
+                       amount_sats, fee_sats, metadata, created_at, updated_at
+                FROM transactions
+                ORDER BY created_at DESC
+                LIMIT $1 OFFSET $2
+                "#,
+                &[&limit_val, &offset_val],
+            )
+            .await
+            .map_err(|e| Error::StorageError(format!("Failed to query transactions: {}", e)))?;
+
+        let mut transactions = Vec::new();
+        for row in rows {
+            transactions.push(Transaction {
+                id: row.get(0),
+                txid: TxId(row.get(1)),
+                state: parse_transaction_state(row.get(2)),
+                unsigned_tx: row.get(3),
+                signed_tx: row.get(4),
+                recipient: row.get(5),
+                amount_sats: row.get::<_, i64>(6) as u64,
+                fee_sats: row.get::<_, i64>(7) as u64,
+                metadata: row.get(8),
+                created_at: row.get(9),
+                updated_at: row.get(10),
+            });
+        }
+
+        info!(
+            "Listed {} transactions (limit: {}, offset: {})",
+            transactions.len(),
+            limit_val,
+            offset_val
+        );
+
+        Ok(transactions)
+    }
+
     /// Create a voting round
     pub async fn create_voting_round(&self, round: &VotingRound) -> Result<i64> {
         let client = self
@@ -343,7 +400,7 @@ impl PostgresStorage {
             .query_one(
                 r#"
                 INSERT INTO voting_rounds (tx_id, round_number, total_nodes, threshold, timeout_at)
-                VALUES ($1, $2, $3, $4, NOW() + INTERVAL '5 minutes')
+                VALUES ($1, $2, $3, $4, $5)
                 RETURNING id
                 "#,
                 &[
@@ -351,6 +408,7 @@ impl PostgresStorage {
                     &(round.round_number as i32),
                     &(round.total_nodes as i32),
                     &(round.threshold as i32),
+                    &round.timeout_at,
                 ],
             )
             .await
@@ -395,6 +453,76 @@ impl PostgresStorage {
             .map_err(|e| {
                 Error::StorageError(format!("Failed to update voting round: {}", e))
             })?;
+
+        Ok(())
+    }
+
+    /// Get voting round by transaction ID
+    pub async fn get_voting_round_by_txid(&self, txid: &str) -> Result<Option<VotingRound>> {
+        let client = self.pool.get().await
+            .map_err(|e| Error::StorageError(format!("Failed to get client: {}", e)))?;
+
+        let row = client.query_opt(
+            r#"
+            SELECT id, tx_id, round_number, total_nodes, threshold,
+                   votes_received, approved, completed, started_at,
+                   completed_at, timeout_at
+            FROM voting_rounds
+            WHERE tx_id = $1
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+            &[&txid],
+        ).await
+        .map_err(|e| Error::StorageError(format!("Failed to get voting round: {}", e)))?;
+
+        Ok(row.map(|r| VotingRound {
+            id: r.get::<_, i64>(0),
+            tx_id: TxId(r.get::<_, String>(1)),
+            round_number: r.get::<_, i32>(2) as u32,
+            total_nodes: r.get::<_, i32>(3) as u32,
+            threshold: r.get::<_, i32>(4) as u32,
+            votes_received: r.get::<_, i32>(5) as u32,
+            approved: r.get::<_, bool>(6),
+            completed: r.get::<_, bool>(7),
+            started_at: r.get::<_, chrono::DateTime<chrono::Utc>>(8),
+            completed_at: r.get::<_, Option<chrono::DateTime<chrono::Utc>>>(9),
+            timeout_at: r.get::<_, chrono::DateTime<chrono::Utc>>(10),
+        }))
+    }
+
+    /// Update voting round approved status
+    pub async fn update_voting_round_approved(&self, round_id: i64, approved: bool) -> Result<()> {
+        let client = self.pool.get().await
+            .map_err(|e| Error::StorageError(format!("Failed to get client: {}", e)))?;
+
+        client.execute(
+            r#"
+            UPDATE voting_rounds
+            SET approved = $1, completed = true, completed_at = NOW()
+            WHERE id = $2
+            "#,
+            &[&approved, &round_id],
+        ).await
+        .map_err(|e| Error::StorageError(format!("Failed to update voting round approved: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Update voting round completed status (without approval)
+    pub async fn update_voting_round_completed(&self, round_id: i64) -> Result<()> {
+        let client = self.pool.get().await
+            .map_err(|e| Error::StorageError(format!("Failed to get client: {}", e)))?;
+
+        client.execute(
+            r#"
+            UPDATE voting_rounds
+            SET completed = true, completed_at = NOW()
+            WHERE id = $1
+            "#,
+            &[&round_id],
+        ).await
+        .map_err(|e| Error::StorageError(format!("Failed to update voting round completed: {}", e)))?;
 
         Ok(())
     }
@@ -503,7 +631,7 @@ impl PostgresStorage {
             .query_opt(
                 r#"
                 SELECT status, last_heartbeat, total_votes, total_violations, banned_until,
-                       EXTRACT(EPOCH FROM (NOW() - last_heartbeat)) as seconds_since_heartbeat
+                       CAST(EXTRACT(EPOCH FROM (NOW() - last_heartbeat)) AS DOUBLE PRECISION) as seconds_since_heartbeat
                 FROM node_status
                 WHERE node_id = $1
                 "#,
@@ -522,6 +650,195 @@ impl PostgresStorage {
                 "seconds_since_heartbeat": r.get::<_, f64>(5),
             })
         }))
+    }
+
+    /// Get all transactions by state
+    pub async fn get_transactions_by_state(&self, state: &str) -> Result<Vec<Transaction>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::StorageError(format!("Failed to get client: {}", e)))?;
+
+        let rows = client
+            .query(
+                r#"
+                SELECT id, txid, state, unsigned_tx, signed_tx, recipient,
+                       amount_sats, fee_sats, metadata, created_at, updated_at
+                FROM transactions
+                WHERE state = $1
+                ORDER BY created_at ASC
+                "#,
+                &[&state],
+            )
+            .await
+            .map_err(|e| Error::StorageError(format!("Failed to get transactions: {}", e)))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| Transaction {
+                id: r.get(0),
+                txid: TxId(r.get(1)),
+                state: parse_transaction_state(r.get(2)),
+                unsigned_tx: r.get(3),
+                signed_tx: r.get(4),
+                recipient: r.get(5),
+                amount_sats: r.get::<_, i64>(6) as u64,
+                fee_sats: r.get::<_, i64>(7) as u64,
+                metadata: r.get(8),
+                created_at: r.get(9),
+                updated_at: r.get(10),
+            })
+            .collect())
+    }
+
+    /// Get votes for a specific voting round
+    pub async fn get_votes_for_round(&self, tx_id: &TxId, round_number: u32) -> Result<Vec<Vote>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::StorageError(format!("Failed to get client: {}", e)))?;
+
+        let rows = client
+            .query(
+                r#"
+                SELECT v.node_id, v.tx_id, v.peer_id, v.round_id, v.approve, v.value,
+                       v.signature, v.public_key, v.created_at
+                FROM votes v
+                JOIN voting_rounds vr ON v.round_id = vr.id
+                WHERE vr.tx_id = $1 AND vr.round_number = $2
+                "#,
+                &[&tx_id.0, &(round_number as i32)],
+            )
+            .await
+            .map_err(|e| Error::StorageError(format!("Failed to get votes: {}", e)))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| Vote {
+                tx_id: TxId(r.get(1)),
+                node_id: NodeId(r.get::<_, i64>(0) as u64),
+                peer_id: PeerId(r.get(2)),
+                round_id: r.get::<_, i64>(3) as u64,
+                approve: r.get(4),
+                value: r.get::<_, i64>(5) as u64,
+                signature: r.get(6),
+                public_key: r.get(7),
+                timestamp: r.get(8),
+            })
+            .collect())
+    }
+
+    /// Get signed transaction bytes
+    pub async fn get_signed_transaction(&self, tx_id: &TxId) -> Result<Option<Vec<u8>>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::StorageError(format!("Failed to get client: {}", e)))?;
+
+        let row = client
+            .query_opt(
+                "SELECT signed_tx FROM transactions WHERE txid = $1",
+                &[&tx_id.0],
+            )
+            .await
+            .map_err(|e| Error::StorageError(format!("Failed to get signed transaction: {}", e)))?;
+
+        Ok(row.and_then(|r| r.get(0)))
+    }
+
+    /// Update transaction txid
+    pub async fn update_transaction_txid(&self, tx_id: &TxId, txid: &str) -> Result<()> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::StorageError(format!("Failed to get client: {}", e)))?;
+
+        client
+            .execute(
+                "UPDATE transactions SET txid = $1, updated_at = NOW() WHERE txid = $2",
+                &[&txid, &tx_id.0],
+            )
+            .await
+            .map_err(|e| Error::StorageError(format!("Failed to update transaction txid: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Record audit event for a transaction
+    pub async fn record_audit_event(&self, tx_id: &TxId, event_type: &str, details: &str) -> Result<()> {
+        self.log_audit_event(
+            event_type,
+            None,
+            Some(tx_id),
+            serde_json::json!({ "details": details }),
+        )
+        .await
+    }
+
+    /// Update transaction confirmations count
+    pub async fn update_transaction_confirmations(&self, tx_id: &TxId, confirmations: u32) -> Result<()> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::StorageError(format!("Failed to get client: {}", e)))?;
+
+        client
+            .execute(
+                "UPDATE transactions SET confirmations = $1, updated_at = NOW() WHERE txid = $2",
+                &[&(confirmations as i32), &tx_id.0],
+            )
+            .await
+            .map_err(|e| Error::StorageError(format!("Failed to update confirmations: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Get expired transactions (transactions that have been in voting/signing state for too long)
+    pub async fn get_expired_transactions(&self, cutoff: chrono::DateTime<chrono::Utc>) -> Result<Vec<Transaction>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::StorageError(format!("Failed to get client: {}", e)))?;
+
+        let rows = client
+            .query(
+                "SELECT id, txid, state, unsigned_tx, signed_tx, recipient, amount_sats, fee_sats,
+                        metadata, created_at, updated_at
+                 FROM transactions
+                 WHERE (state = 'voting' OR state = 'signing' OR state = 'broadcasting')
+                   AND updated_at < $1
+                 ORDER BY updated_at ASC",
+                &[&cutoff],
+            )
+            .await
+            .map_err(|e| Error::StorageError(format!("Failed to get expired transactions: {}", e)))?;
+
+        let transactions = rows
+            .into_iter()
+            .map(|row| {
+                Transaction {
+                    id: row.get(0),
+                    txid: TxId(row.get(1)),
+                    state: parse_transaction_state(row.get(2)),
+                    unsigned_tx: row.get(3),
+                    signed_tx: row.get(4),
+                    recipient: row.get(5),
+                    amount_sats: row.get::<_, i64>(6) as u64,
+                    fee_sats: row.get::<_, i64>(7) as u64,
+                    metadata: row.get(8),
+                    created_at: row.get(9),
+                    updated_at: row.get(10),
+                }
+            })
+            .collect();
+
+        Ok(transactions)
     }
 }
 

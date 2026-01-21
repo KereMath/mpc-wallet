@@ -76,7 +76,32 @@
       "Bash(docker builder prune:*)",
       "Bash(curl:*)",
       "Bash(docker port:*)",
-      "Bash(docker images:*)"
+      "Bash(docker images:*)",
+      "Bash(docker stop:*)",
+      "Bash(docker rm:*)",
+      "Bash(xargs:*)",
+      "Bash(docker volume:*)",
+      "Bash(cargo clean:*)",
+      "Bash(jq:*)",
+      "Bash(python -m json.tool:*)",
+      "Bash(for:*)",
+      "Bash(cargo doc:*)",
+      "Bash(docker cp:*)",
+      "Bash(TX_ID=\"8cbe929071e51837379d60abbe5f0e5594d004dfa9812a7f335058880938cc8f\")",
+      "Bash(ROUND_ID=2:*)",
+      "Bash(TX_ID=\"80996a31c6f93685b618fb3aaa91b5bd7178ecec2350910863b4a2683aac81ea\")",
+      "Bash(TXID=\"manual_vote_test_1768997074\")",
+      "Bash(TXID=\"manual_vote_test_1768997154\")",
+      "Bash(ROUND_ID=3:*)",
+      "Bash(TXID=\"lifecycle_test_1768997272\")",
+      "Bash(docker stats:*)",
+      "Bash(docker:*)",
+      "Bash(docker compose:*)",
+      "Bash(wmic:*)",
+      "Bash(rustc:*)",
+      "Bash(winpty docker exec -it mpc-node-1 /app/mpc-wallet-server --help)",
+      "Bash(TXID=\"71a90fed16f6db8bef15d59b096826703a0ef2782d9e5e6d2fde0708fd4a91fd\")",
+      "Bash(TXID=\"e81b201b8810c0bfcb1c0dd6e2845c4001eff520955637e7b895dd663f1afe96\")"
     ]
   }
 }
