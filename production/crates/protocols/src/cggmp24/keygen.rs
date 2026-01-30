@@ -76,13 +76,29 @@ pub async fn run_keygen(
     // Create MPC party
     let party = round_based::MpcParty::connected((incoming_boxed, outgoing_boxed));
 
-    // Run the keygen protocol
-    info!("Starting keygen protocol...");
-    let keygen_result =
+    // Run the keygen protocol with timeout
+    // DKG can take up to 60 seconds for 5 parties
+    info!("Starting keygen protocol (60s timeout)...");
+    let protocol_timeout = std::time::Duration::from_secs(60);
+    let mut rng = OsRng;
+    let keygen_future =
         cggmp24::keygen::<cggmp24::supported_curves::Secp256k1>(eid, party_index, num_parties)
             .set_threshold(threshold)
-            .start(&mut OsRng, party)
-            .await;
+            .start(&mut rng, party);
+
+    let keygen_result = match tokio::time::timeout(protocol_timeout, keygen_future).await {
+        Ok(result) => result,
+        Err(_) => {
+            error!("Keygen protocol timed out after {:?}", protocol_timeout);
+            return KeygenResult {
+                success: false,
+                key_share_data: None,
+                public_key: None,
+                error: Some(format!("Protocol timed out after {:?}", protocol_timeout)),
+                duration_secs: protocol_timeout.as_secs_f64(),
+            };
+        }
+    };
 
     let elapsed = start.elapsed();
 

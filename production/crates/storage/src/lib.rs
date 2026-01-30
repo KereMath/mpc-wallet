@@ -13,6 +13,8 @@ pub struct DkgCeremony {
     pub total_nodes: u32,
     pub status: String,
     pub public_key: Option<Vec<u8>>,
+    /// Bitcoin address derived from public key
+    pub address: Option<String>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub error: Option<String>,

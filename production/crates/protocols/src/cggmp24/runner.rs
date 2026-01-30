@@ -13,7 +13,7 @@ use futures::sink::Sink;
 use futures::stream::Stream;
 use pin_project_lite::pin_project;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tracing::warn;
+use tracing::{warn, error};
 
 /// Network message wrapper for MPC protocols
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +109,8 @@ impl ChannelDelivery {
             receiver: self.incoming_rx,
             session_id: self.session_id.clone(),
             party_to_signer: self.party_to_signer.clone(),
+            // DEDUPLICATION: Initialize empty set to track seen messages
+            seen_messages: std::collections::HashSet::new(),
             _phantom: PhantomData,
         };
         let outgoing = OutgoingSink {
@@ -125,12 +127,17 @@ impl ChannelDelivery {
 
 pin_project! {
     /// Stream adapter for incoming protocol messages
+    ///
+    /// CRITICAL FIX: Includes message deduplication to prevent AttemptToOverwriteReceivedMsg errors.
+    /// Messages are tracked by (sender, seq) pairs and duplicates are silently dropped.
     pub struct IncomingStream<M> {
         #[pin]
         receiver: Receiver<ProtocolMessage>,
         session_id: String,
         // Maps party_index -> signer_index for incoming messages
         party_to_signer: Option<HashMap<u16, u16>>,
+        // DEDUPLICATION: Track seen messages by (sender, seq) to prevent duplicates
+        seen_messages: std::collections::HashSet<(u16, u64)>,
         _phantom: PhantomData<M>,
     }
 }
@@ -152,6 +159,17 @@ impl<M: DeserializeOwned> Stream for IncomingStream<M> {
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
+
+                // DEDUPLICATION: Check if we've already seen this (sender, seq) pair
+                // This prevents AttemptToOverwriteReceivedMsg errors from duplicate messages
+                let dedup_key = (msg.sender, msg.seq);
+                if this.seen_messages.contains(&dedup_key) {
+                    // Silently drop duplicate message
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                // Mark this message as seen
+                this.seen_messages.insert(dedup_key);
 
                 // Convert sender from party_index to signer_index if mapping exists
                 let sender = if let Some(mapping) = this.party_to_signer {
@@ -356,11 +374,25 @@ pub async fn run_aux_info_gen(
     // Create MPC party (takes a tuple of (stream, sink))
     let party = round_based::MpcParty::connected((incoming_boxed, outgoing_boxed));
 
-    // Run the protocol
-    info!("Starting aux_info_gen protocol...");
-    let result = cggmp24::aux_info_gen(eid, party_index, num_parties, primes)
-        .start(&mut OsRng, party)
-        .await;
+    // Run the protocol with timeout
+    // Aux info generation can take up to 60 seconds for 5 parties
+    info!("Starting aux_info_gen protocol (60s timeout)...");
+    let protocol_timeout = std::time::Duration::from_secs(60);
+    let aux_future = cggmp24::aux_info_gen(eid, party_index, num_parties, primes)
+        .start(&mut OsRng, party);
+
+    let result = match tokio::time::timeout(protocol_timeout, aux_future).await {
+        Ok(r) => r,
+        Err(_) => {
+            error!("Aux info protocol timed out after {:?}", protocol_timeout);
+            return AuxInfoGenResult {
+                success: false,
+                aux_info_data: None,
+                error: Some(format!("Protocol timed out after {:?}", protocol_timeout)),
+                duration_secs: protocol_timeout.as_secs_f64(),
+            };
+        }
+    };
 
     let elapsed = start.elapsed();
 

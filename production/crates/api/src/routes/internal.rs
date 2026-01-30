@@ -10,5 +10,6 @@ pub fn routes() -> Router<AppState> {
         .route("/vote-request", post(internal::receive_vote_request))
         .route("/dkg-join", post(internal::receive_dkg_join_request))
         .route("/aux-info-join", post(internal::receive_aux_info_join_request))
+        .route("/presig-join", post(internal::receive_presig_join_request))
         .route("/signing-join", post(internal::receive_signing_join_request))
 }

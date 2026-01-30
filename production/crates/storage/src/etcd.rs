@@ -236,10 +236,45 @@ impl EtcdStorage {
         self.acquire_lock_internal(key, LOCK_TTL_SECS).await
     }
 
+    /// Try to acquire presignature generation lock (non-blocking)
+    ///
+    /// Returns:
+    /// - Ok(Some(lease_id)) if lock acquired successfully
+    /// - Ok(None) if lock is held by another node (not an error)
+    /// - Err() only for actual storage errors
+    ///
+    /// FIX SORUN #14: This is the preferred method for presignature generation
+    /// because it clearly distinguishes between "lock held" and "actual error"
+    pub async fn try_acquire_presig_generation_lock(&mut self) -> Result<Option<i64>> {
+        let key = "/locks/presig-generation";
+        match self.acquire_lock_internal(key, LOCK_TTL_SECS).await {
+            Ok(lease_id) => Ok(Some(lease_id)),
+            Err(e) if e.to_string().contains("already locked") => {
+                // Lock is held by another node - this is expected, not an error
+                Ok(None)
+            }
+            Err(e) => Err(e), // Actual storage error
+        }
+    }
+
     /// Release the presignature generation lock
     pub async fn release_presig_generation_lock(&mut self) -> Result<()> {
         let key = "/locks/presig-generation";
         self.release_lock_internal(key).await
+    }
+
+    /// Revoke a lease to immediately release all keys associated with it
+    ///
+    /// This is more reliable than delete for lock release because it ensures
+    /// the lease is terminated and won't be renewed.
+    pub async fn revoke_lease(&mut self, lease_id: i64) -> Result<()> {
+        self.client
+            .lease_revoke(lease_id)
+            .await
+            .map_err(|e| Error::StorageError(format!("Failed to revoke lease: {}", e)))?;
+
+        info!("Revoked lease {}", lease_id);
+        Ok(())
     }
 
     /// Acquire a lock for DKG session

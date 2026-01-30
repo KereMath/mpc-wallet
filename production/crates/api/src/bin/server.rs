@@ -175,10 +175,31 @@ async fn main() -> Result<()> {
     ));
     info!("Aux info service initialized");
 
+    // Create presignature service (needed by signing coordinator and AppState)
+    let presig_service = Arc::new(threshold_orchestrator::PresignatureService::new(
+        Arc::clone(&quic_engine),
+        Arc::clone(&message_router),
+        Arc::clone(&postgres),
+        Arc::clone(&etcd),
+        Arc::clone(&aux_info_service),
+        threshold_types::NodeId(config.node_id),
+        node_endpoints_map.clone(), // SORUN #19 FIX: Add node_endpoints for broadcasting
+    ));
+    info!("Presignature service initialized");
+
     // Create vote trigger channel for automatic voting
     let (vote_tx, vote_rx) = tokio::sync::mpsc::channel(100);
 
-    let state = AppState::new(postgres_for_state, etcd_for_state, bitcoin_for_state, Arc::clone(&dkg_service), Arc::clone(&aux_info_service), vote_tx);
+    let state = AppState::new(
+        postgres_for_state,
+        etcd_for_state,
+        bitcoin_for_state,
+        Arc::clone(&dkg_service),
+        Arc::clone(&aux_info_service),
+        Arc::clone(&presig_service),
+        Arc::clone(&message_router),
+        vote_tx,
+    );
 
     // Parse listen address
     let addr: SocketAddr = config.listen_addr.parse()?;
@@ -273,18 +294,7 @@ async fn main() -> Result<()> {
         ));
         info!("Aux info service initialized for orchestration");
 
-        // Create presignature service (needed by signing coordinator)
-        let presig_service = Arc::new(threshold_orchestrator::PresignatureService::new(
-            Arc::clone(&quic_engine),
-            Arc::clone(&message_router),
-            Arc::clone(&postgres),
-            Arc::clone(&etcd),
-            Arc::clone(&aux_info_for_presig),
-            threshold_types::NodeId(config.node_id),
-        ));
-        info!("Presignature service initialized");
-
-        // Start presignature generation background loop
+        // Start presignature generation background loop (presig_service already created above)
         let presig_service_clone = Arc::clone(&presig_service);
         tokio::spawn(async move {
             presig_service_clone.run_generation_loop().await;

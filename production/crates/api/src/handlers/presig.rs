@@ -53,22 +53,21 @@ pub struct GeneratePresigResponse {
 ///
 /// GET /api/v1/presignatures/status
 pub async fn presignature_status(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> Result<Json<PresigStatusResponse>, ApiError> {
-    // TODO: Query actual presignature pool status
-    // let stats = state.presig_service.get_stats().await;
+    // Query actual presignature pool status
+    let stats = state.presig_service.get_stats().await;
 
-    // Mock response
     let response = PresigStatusResponse {
-        current_size: 75,
-        target_size: 100,
-        max_size: 150,
-        utilization: 75.0,
-        is_healthy: true,
-        is_critical: false,
-        hourly_usage: 12,
-        total_generated: 500,
-        total_used: 425,
+        current_size: stats.current_size,
+        target_size: stats.target_size,
+        max_size: stats.max_size,
+        utilization: stats.utilization,
+        is_healthy: stats.is_healthy(),
+        is_critical: stats.is_critical(),
+        hourly_usage: stats.hourly_usage,
+        total_generated: stats.total_generated,
+        total_used: stats.total_used,
     };
 
     Ok(Json(response))
@@ -78,7 +77,7 @@ pub async fn presignature_status(
 ///
 /// POST /api/v1/presignatures/generate
 pub async fn generate_presignatures(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<GeneratePresigRequest>,
 ) -> Result<Json<GeneratePresigResponse>, ApiError> {
     // Validate count
@@ -94,16 +93,19 @@ pub async fn generate_presignatures(
         ));
     }
 
-    // TODO: Trigger actual presignature generation
-    // let start = std::time::Instant::now();
-    // let generated = state.presig_service.generate_batch(req.count).await?;
-    // let duration_ms = start.elapsed().as_millis() as u64;
+    // Trigger actual presignature generation
+    let start = std::time::Instant::now();
+    let generated = state.presig_service.generate_batch(req.count).await
+        .map_err(|e| ApiError::InternalError(format!("Presignature generation failed: {}", e)))?;
+    let duration_ms = start.elapsed().as_millis() as u64;
 
-    // Mock response
+    // Get new pool size
+    let stats = state.presig_service.get_stats().await;
+
     let response = GeneratePresigResponse {
-        generated: req.count,
-        new_pool_size: 75 + req.count,
-        duration_ms: req.count as u64 * 400, // ~400ms per presignature
+        generated,
+        new_pool_size: stats.current_size,
+        duration_ms,
     };
 
     Ok(Json(response))

@@ -112,6 +112,84 @@ pub async fn receive_aux_info_join_request(
     Ok(Json("Aux_info join request received"))
 }
 
+/// Presignature join request from coordinator
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresigJoinRequest {
+    pub session_id: String,
+    pub participants: Vec<u64>, // Node IDs
+}
+
+/// Receive a presignature join request from coordinator
+///
+/// POST /internal/presig-join
+///
+/// SORUN #19 FIX #4: Allow participant nodes to join presignature sessions.
+/// This endpoint spawns a task to join the presignature protocol, similar to
+/// DKG and Aux-Info ceremonies.
+///
+/// FIX SORUN #14: Check for duplicate sessions before joining to prevent
+/// AttemptToOverwriteReceivedMsg errors from concurrent session handling.
+pub async fn receive_presig_join_request(
+    State(state): State<AppState>,
+    Json(req): Json<PresigJoinRequest>,
+) -> Result<Json<&'static str>, ApiError> {
+    info!(
+        "Received presig join request for session_id={} participants={:?}",
+        req.session_id, req.participants
+    );
+
+    // Parse session ID
+    let session_uuid = uuid::Uuid::parse_str(&req.session_id)
+        .map_err(|_| ApiError::BadRequest("Invalid session ID format".into()))?;
+
+    // FIX: Check if session is already registered to prevent duplicate handling
+    if state.message_router.is_session_registered(session_uuid).await {
+        info!(
+            "Presig session {} already registered, ignoring duplicate request",
+            session_uuid
+        );
+        return Ok(Json("Presig session already in progress"));
+    }
+
+    // Convert participants to NodeId
+    let participants: Vec<threshold_types::NodeId> = req
+        .participants
+        .iter()
+        .map(|&id| threshold_types::NodeId(id))
+        .collect();
+
+    // Join the presignature session automatically (similar to DKG/Aux-Info)
+    // SORUN #19 FIX #4: Spawn a task to run the presignature protocol
+    tokio::spawn(async move {
+        match state
+            .presig_service
+            .join_presignature_session(session_uuid, participants)
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    "Successfully joined presignature session: session_id={}",
+                    session_uuid
+                );
+            }
+            Err(e) => {
+                // FIX: Don't log SessionAlreadyExists as error - it's expected behavior
+                let error_msg = e.to_string();
+                if error_msg.contains("already exists") || error_msg.contains("already registered") {
+                    info!(
+                        "Presig session {} skipped (already in progress): {}",
+                        session_uuid, error_msg
+                    );
+                } else {
+                    tracing::error!("Failed to join presignature session: {}", e);
+                }
+            }
+        }
+    });
+
+    Ok(Json("Presig join request received"))
+}
+
 /// Signing join request from coordinator
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SigningJoinRequest {

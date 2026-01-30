@@ -115,6 +115,7 @@ services:
       - ./init-db/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
       - ./init-db/02_migrations.sql:/docker-entrypoint-initdb.d/02_migrations.sql:ro
       - ./init-db/03_triggers.sql:/docker-entrypoint-initdb.d/03_triggers.sql:ro
+      - ./init-db/04_user_addresses.sql:/docker-entrypoint-initdb.d/04_user_addresses.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mpc} -d ${POSTGRES_DB:-mpc_wallet}"]
       interval: 10s

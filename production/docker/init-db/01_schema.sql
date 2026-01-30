@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS dkg_ceremonies (
     total_nodes INTEGER NOT NULL CHECK (total_nodes > 0),
     status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
     public_key BYTEA,
+    address TEXT,  -- Bitcoin address derived from public key
     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at TIMESTAMPTZ,
     error TEXT,

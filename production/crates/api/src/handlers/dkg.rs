@@ -148,7 +148,7 @@ pub async fn dkg_status(
         .filter(|c| matches!(c.status, threshold_orchestrator::DkgStatus::Completed))
         .count();
 
-    // Get latest CGGMP24 public key
+    // Get latest CGGMP24 ceremony
     let cggmp24_ceremony = ceremonies
         .iter()
         .filter(|c| c.protocol == ProtocolType::CGGMP24
@@ -156,19 +156,14 @@ pub async fn dkg_status(
         .max_by_key(|c| c.completed_at);
 
     let (cggmp24_public_key, cggmp24_address) = if let Some(ceremony) = cggmp24_ceremony {
-        if let Some(ref pubkey) = ceremony.public_key {
-            let pubkey_hex = hex::encode(pubkey);
-            // TODO: Generate actual Bitcoin address from public key
-            let addr = format!("bc1q{}", "a".repeat(38));
-            (Some(pubkey_hex), Some(addr))
-        } else {
-            (None, None)
-        }
+        let pubkey_hex = ceremony.public_key.as_ref().map(|pk| hex::encode(pk));
+        let addr = ceremony.address.clone();
+        (pubkey_hex, addr)
     } else {
         (None, None)
     };
 
-    // Get latest FROST public key
+    // Get latest FROST ceremony
     let frost_ceremony = ceremonies
         .iter()
         .filter(|c| c.protocol == ProtocolType::FROST
@@ -176,14 +171,9 @@ pub async fn dkg_status(
         .max_by_key(|c| c.completed_at);
 
     let (frost_public_key, frost_address) = if let Some(ceremony) = frost_ceremony {
-        if let Some(ref pubkey) = ceremony.public_key {
-            let pubkey_hex = hex::encode(pubkey);
-            // TODO: Generate actual Bitcoin address from public key
-            let addr = format!("bc1p{}", "b".repeat(58));
-            (Some(pubkey_hex), Some(addr))
-        } else {
-            (None, None)
-        }
+        let pubkey_hex = ceremony.public_key.as_ref().map(|pk| hex::encode(pk));
+        let addr = ceremony.address.clone();
+        (pubkey_hex, addr)
     } else {
         (None, None)
     };

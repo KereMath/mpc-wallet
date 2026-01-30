@@ -330,6 +330,25 @@ impl BitcoinClient {
             None => Ok(0), // Not confirmed yet
         }
     }
+
+    /// Get balance for an address.
+    /// Returns confirmed and unconfirmed balances in satoshis.
+    pub async fn get_balance(&self, address: &str) -> Result<Balance, BitcoinError> {
+        let info = self.get_address_info(address).await?;
+        Ok(Balance {
+            confirmed: info.confirmed_balance(),
+            unconfirmed: info.unconfirmed_balance().max(0) as u64,
+        })
+    }
+}
+
+/// Simple balance structure with confirmed and unconfirmed amounts.
+#[derive(Debug, Clone)]
+pub struct Balance {
+    /// Confirmed balance in satoshis
+    pub confirmed: u64,
+    /// Unconfirmed balance in satoshis
+    pub unconfirmed: u64,
 }
 
 #[cfg(test)]

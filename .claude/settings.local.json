@@ -118,7 +118,12 @@
       "Bash(fi)",
       "Bash(timeout 10 tail:*)",
       "Bash(timeout 30 tail:*)",
-      "Bash(PARTY_INDEX=0 RUST_LOG=info cargo run:*)"
+      "Bash(PARTY_INDEX=0 RUST_LOG=info cargo run:*)",
+      "Bash(timeout /t 20 /nobreak)",
+      "Bash(Start-Sleep -Seconds 20)",
+      "Bash(timeout:*)",
+      "Bash(npm install:*)",
+      "Bash(npm run build:*)"
     ]
   }
 }

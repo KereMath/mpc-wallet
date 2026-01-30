@@ -114,6 +114,12 @@ pub struct PresignatureService {
     max_size: usize,
     /// Generation statistics
     stats: Arc<RwLock<GenerationStats>>,
+    /// HTTP client for broadcasting to nodes (SORUN #19 FIX)
+    http_client: reqwest::Client,
+    /// Node endpoints (node_id -> endpoint URL) (SORUN #19 FIX)
+    node_endpoints: std::collections::HashMap<u64, String>,
+    /// Semaphore to ensure only 1 presignature session runs at a time (FIX: Duplicate message)
+    presig_session_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Debug, Default)]
@@ -133,6 +139,7 @@ impl PresignatureService {
         etcd: Arc<Mutex<EtcdStorage>>,
         aux_info_service: Arc<super::aux_info_service::AuxInfoService>,
         node_id: NodeId,
+        node_endpoints: std::collections::HashMap<u64, String>,
     ) -> Self {
         Self {
             pool: Arc::new(RwLock::new(Vec::new())),
@@ -146,6 +153,10 @@ impl PresignatureService {
             min_size: 20,
             max_size: 150,
             stats: Arc::new(RwLock::new(GenerationStats::default())),
+            http_client: reqwest::Client::new(),
+            node_endpoints,
+            // FIX: Semaphore with 1 permit - only 1 presignature session at a time
+            presig_session_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -155,30 +166,52 @@ impl PresignatureService {
     /// 1. Checking pool size every 10 seconds
     /// 2. Triggering refill when below minimum threshold
     /// 3. Generating presignatures in batches
+    ///
+    /// Presignature generation loop - runs ONLY on node 1 (coordinator)
+    ///
+    /// CRITICAL: Only node 1 runs this loop. Other nodes ONLY participate
+    /// when they receive a presig-join request via HTTP. This prevents:
+    /// - Race conditions where multiple nodes try to generate simultaneously
+    /// - Session collisions and AttemptToOverwriteReceivedMsg errors
+    /// - Distributed lock contention
     pub async fn run_generation_loop(self: Arc<Self>) {
-        info!("Starting presignature generation loop");
-
-        // CLEANUP: Remove any stuck locks from previous sessions on startup
-        // This fixes SORUN #14: Presignature lock stuck after crash/restart
-        info!("Checking for stuck presignature generation locks...");
-        let lock_key = "/locks/presig-generation";
-        {
-            let etcd = self.etcd.lock().await;
-            match etcd.release_lock(lock_key).await {
-                Ok(_) => info!("Cleaned up stuck presignature lock on startup"),
-                Err(e) => {
-                    // Ignore error if lock doesn't exist (expected case)
-                    if !e.to_string().contains("key not found") && !e.to_string().contains("Failed to release lock") {
-                        warn!("Could not cleanup presignature lock: {}", e);
-                    } else {
-                        info!("No stuck lock found (clean startup)");
-                    }
-                }
+        // CRITICAL: Only node 1 runs the generation loop
+        // Other nodes participate ONLY via presig-join requests
+        if self.node_id.0 != 1 {
+            info!(
+                "Node {} is not the coordinator - presig loop disabled. \
+                 Will participate via presig-join requests only.",
+                self.node_id.0
+            );
+            // Keep the task alive but do nothing
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
             }
         }
 
+        info!("Node 1 starting presignature generation loop (coordinator)");
+
+        // Wait for system to stabilize after startup
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
+
+            // SPAM FIX: Check if prerequisites (DKG + AuxInfo) are available
+            // If not, wait silently instead of spamming error logs
+            let has_aux_info = self.aux_info_service.get_latest_aux_info().await.is_some();
+
+            // Check if DKG config exists in etcd (indicates DKG completed)
+            let has_dkg = {
+                let mut etcd = self.etcd.lock().await;
+                etcd.get("/cluster/dkg/cggmp24/config").await.ok().flatten().is_some()
+            };
+
+            if !has_aux_info || !has_dkg {
+                // Prerequisites not ready - wait silently
+                // This prevents "No aux_info available" spam in logs
+                continue;
+            }
 
             let stats = self.get_stats().await;
 
@@ -196,42 +229,94 @@ impl PresignatureService {
 
             // Refill if below minimum
             if stats.current_size < self.min_size {
-                // LEADER ELECTION: Use round-robin based on timestamp to distribute generation work
-                // This prevents all 5 nodes from trying to generate simultaneously (lock collision)
-                let now = chrono::Utc::now();
-                let seconds_since_epoch = now.timestamp() as u64;
-                let round_number = seconds_since_epoch / 10; // Changes every 10 seconds
-                let assigned_node = (round_number % 5) + 1; // Nodes are 1-5
 
-                if self.node_id.0 == assigned_node {
-                    let batch_size = (self.target_size - stats.current_size).min(20); // Max 20 per batch
-                    warn!(
-                        "Node {} selected as leader for this round - Pool below minimum ({} < {}), generating {} presignatures...",
-                        self.node_id.0, stats.current_size, self.min_size, batch_size
-                    );
+                // STABILITY FIX: Generate only 1 presignature per batch cycle
+                // to prevent concurrent session conflicts and AttemptToOverwriteReceivedMsg errors.
+                // Once stable, this can be increased back to larger batches.
+                let batch_size = 1;
 
-                    match self.generate_batch(batch_size).await {
-                        Ok(count) => {
-                            info!("Successfully generated {} presignatures", count);
-                            let mut gen_stats = self.stats.write().await;
-                            gen_stats.total_generated += count as u64;
-                            gen_stats.last_generation = Some(chrono::Utc::now());
-                        }
-                        Err(e) => {
-                            error!("Failed to generate presignatures: {}", e);
+                info!(
+                    "Node {} is presig leader, attempting generation (pool: {}/{})",
+                    self.node_id.0, stats.current_size, self.min_size
+                );
+
+                // Try to acquire the lock (non-blocking)
+                // generate_batch() already acquires the lock internally, so it will either:
+                // 1. Succeed if this node gets the lock (becomes leader)
+                // 2. Fail if another node has the lock (skip this round)
+                match self.generate_batch(batch_size).await {
+                    Ok(count) => {
+                        info!(
+                            "Node {} generated {} presignatures successfully",
+                            self.node_id.0, count
+                        );
+                        let mut gen_stats = self.stats.write().await;
+                        gen_stats.total_generated += count as u64;
+                        gen_stats.last_generation = Some(chrono::Utc::now());
+                    }
+                    Err(e) => {
+                        // This is expected if another node has the lock
+                        if e.to_string().contains("already in progress") || e.to_string().contains("already locked") {
+                            debug!(
+                                "Node {} skipped generation - another node has the lock",
+                                self.node_id.0
+                            );
+                        } else {
+                            error!("Node {} failed to generate presignatures: {}", self.node_id.0, e);
                         }
                     }
-                } else {
-                    debug!(
-                        "Node {} not selected for this round (assigned_node={}), skipping generation",
-                        self.node_id.0, assigned_node
-                    );
                 }
             }
 
             // Cleanup old unused presignatures (older than 24 hours)
             self.cleanup_old_presignatures().await;
         }
+    }
+
+    /// Check if this node should be the presignature generation leader
+    ///
+    /// Leader election rule: The LOWEST numbered node that is active becomes leader.
+    /// This ensures only ONE node attempts to generate presignatures at a time.
+    ///
+    /// Returns: true if this node should attempt generation, false otherwise
+    async fn should_be_presig_leader(&self) -> Result<bool> {
+        // Get active nodes from etcd by checking heartbeats
+        let active_nodes: Vec<u64> = {
+            let mut etcd = self.etcd.lock().await;
+            match etcd.get_active_nodes().await {
+                Ok(nodes) => nodes.into_iter().map(|n| n.0).collect(),
+                Err(e) => {
+                    warn!("Failed to get active nodes from etcd: {}", e);
+                    // Fallback: assume all configured nodes are active
+                    // Only node 1 should attempt in this case
+                    return Ok(self.node_id.0 == 1);
+                }
+            }
+        };
+
+        if active_nodes.is_empty() {
+            // No active nodes found - only node 1 should be leader to avoid conflicts
+            if self.node_id.0 == 1 {
+                info!("No active nodes in etcd, node 1 is leader by default");
+                return Ok(true);
+            } else {
+                debug!("No active nodes in etcd, node {} deferring to node 1", self.node_id.0);
+                return Ok(false);
+            }
+        }
+
+        // Find the lowest active node ID
+        let min_active_node = active_nodes.iter().min().copied().unwrap_or(1);
+
+        let is_leader = self.node_id.0 == min_active_node;
+
+        if is_leader {
+            debug!("Node {} is presig leader (lowest of {:?})", self.node_id.0, active_nodes);
+        } else {
+            debug!("Node {} is not leader (leader is node {})", self.node_id.0, min_active_node);
+        }
+
+        Ok(is_leader)
     }
 
     /// Generate a batch of presignatures
@@ -241,6 +326,8 @@ impl PresignatureService {
     /// 2. Runs CGGMP24 presigning protocol (2 rounds)
     /// 3. Stores presignatures in pool and PostgreSQL
     /// 4. GUARANTEES lock release even on error (SORUN #14 fix)
+    ///
+    /// FIX SORUN #14: Uses try_acquire pattern and lease revocation for reliable lock management
     pub async fn generate_batch(&self, count: usize) -> Result<usize> {
         if count == 0 {
             return Ok(0);
@@ -260,34 +347,47 @@ impl PresignatureService {
 
         info!("Generating {} presignatures...", actual_count);
 
-        // Acquire distributed lock for presignature generation
-        let lock_key = "/locks/presig-generation";
-        let lock_acquired = {
-            let etcd = self.etcd.lock().await;
-            etcd.acquire_lock(lock_key, 300) // 5 minute timeout
-                .await
-                .map_err(|e| {
-                    OrchestrationError::StorageError(format!("Failed to acquire presig lock: {}", e))
-                })?
+        // FIX SORUN #14: Use try_acquire pattern for cleaner lock handling
+        // This returns None if lock is held (not an error), or Some(lease_id) if acquired
+        let lease_id = {
+            let mut etcd = self.etcd.lock().await;
+            match etcd.try_acquire_presig_generation_lock().await {
+                Ok(Some(id)) => {
+                    info!("Node {} acquired presig lock with lease_id={}", self.node_id.0, id);
+                    id
+                }
+                Ok(None) => {
+                    // Lock is held by another node - this is expected behavior
+                    debug!("Node {} could not acquire presig lock (held by another node)", self.node_id.0);
+                    return Err(OrchestrationError::CeremonyInProgress(
+                        "Another presignature generation is in progress".to_string(),
+                    ));
+                }
+                Err(e) => {
+                    error!("Node {} failed to acquire presig lock: {}", self.node_id.0, e);
+                    return Err(OrchestrationError::StorageError(format!(
+                        "Failed to acquire presig lock: {}", e
+                    )));
+                }
+            }
         };
-
-        if !lock_acquired {
-            return Err(OrchestrationError::CeremonyInProgress(
-                "Another presignature generation is in progress".to_string(),
-            ));
-        }
 
         // CRITICAL: Guaranteed lock release even on error (fixes SORUN #14)
         // Execute the actual generation logic and ensure lock is always released
         let result = self.generate_batch_impl(actual_count, current_size).await;
 
-        // ALWAYS release lock, even if generation failed
+        // ALWAYS release lock by revoking the lease
+        // This is more reliable than just deleting the key
         {
-            let etcd = self.etcd.lock().await;
-            if let Err(e) = etcd.release_lock(lock_key).await {
-                error!("Failed to release presig lock (may cause SORUN #14): {}", e);
+            let mut etcd = self.etcd.lock().await;
+            if let Err(e) = etcd.revoke_lease(lease_id).await {
+                error!("Failed to revoke presig lease {} (may cause SORUN #14): {}", lease_id, e);
+                // Try to release lock as fallback
+                if let Err(e2) = etcd.release_presig_generation_lock().await {
+                    error!("Fallback lock release also failed: {}", e2);
+                }
             } else {
-                info!("Released presignature generation lock");
+                info!("Released presignature generation lock (lease {} revoked)", lease_id);
             }
         }
 
@@ -349,7 +449,9 @@ impl PresignatureService {
             key_share_data.len()
         );
 
-        let party_index = self.node_id.0 as u16;
+        // Party index must be 0-indexed (0 to n-1) for round-based protocol
+        // Node IDs are 1-based (1,2,3,4,5) but party indices are 0-based (0,1,2,3,4)
+        let party_index = (self.node_id.0 - 1) as u16;
         let mut generated = 0;
 
         // Generate presignatures
@@ -370,15 +472,18 @@ impl PresignatureService {
                 Ok(participants) => participants,
                 Err(e) => {
                     error!("Failed to get CGGMP24 participants from etcd: {}", e);
-                    // Fallback to default configuration (4 nodes, threshold 3)
-                    warn!("Using fallback participant configuration: 4 nodes");
-                    vec![1, 2, 3, 4]
+                    // CGGMP24 presignature requires EXACTLY threshold parties
+                    // Party indices must be 0-indexed (0 to threshold-1)
+                    warn!("Using fallback participant configuration: threshold=4");
+                    vec![0, 1, 2, 3]  // threshold=4 (default)
                 }
             };
 
+            // Convert party indices (0-indexed) to node IDs (1-indexed)
+            // Party indices [0,1,2,3] -> Node IDs [1,2,3,4]
             let participants_node_ids: Vec<NodeId> = participants_party_indices
                 .iter()
-                .map(|&p| NodeId(p as u64))
+                .map(|&p| NodeId((p + 1) as u64))
                 .collect();
 
             // Register session with message router
@@ -398,9 +503,89 @@ impl PresignatureService {
                 }
             };
 
+            // SORUN #19 FIX: Broadcast presig-join request to all participant nodes
+            // This allows other nodes to register the session and handle QUIC messages
+            if let Err(e) = self
+                .broadcast_presig_join_request(Uuid::parse_str(&session_id).unwrap(), &participants_node_ids)
+                .await
+            {
+                warn!("Failed to broadcast presig join request: {}", e);
+                // Continue anyway - some nodes might still participate via QUIC
+            }
+
+            // ============================================================
+            // CRITICAL FIX: Ready barrier - wait for all participants
+            // ============================================================
+            // Without this barrier, the coordinator starts the protocol before
+            // other nodes have registered their sessions, causing:
+            // - AttemptToOverwriteReceivedMsg errors
+            // - Messages sent to unregistered sessions (dropped)
+            // - Protocol failures due to missing participants
+            //
+            // This is the SAME pattern used in DKG (dkg_service.rs:728-776)
+            // ============================================================
+
+            // Signal that coordinator is ready
+            let barrier_key = format!("/presig/{}/ready/{}", session_id, self.node_id.0);
+            {
+                let etcd = self.etcd.lock().await;
+                if let Err(e) = etcd.put(&barrier_key, &[1]).await {
+                    error!("Failed to signal ready for presig session {}: {}", session_id, e);
+                }
+            }
+
+            // Wait for all participants to be ready (with timeout)
+            let ready_timeout = tokio::time::Duration::from_secs(15);
+            let ready_deadline = tokio::time::Instant::now() + ready_timeout;
+            let expected_ready = participants_node_ids.len();
+
+            info!(
+                "🔄 [Node {}] Waiting for {} participants to be ready for presig session {}",
+                self.node_id.0, expected_ready, session_id
+            );
+
+            let mut all_ready = false;
+            while tokio::time::Instant::now() < ready_deadline {
+                let ready_count = {
+                    let mut etcd = self.etcd.lock().await;
+                    let mut count = 0;
+                    for participant in &participants_node_ids {
+                        let key = format!("/presig/{}/ready/{}", session_id, participant.0);
+                        if let Ok(Some(_)) = etcd.get(&key).await {
+                            count += 1;
+                        }
+                    }
+                    count
+                };
+
+                if ready_count >= expected_ready {
+                    info!(
+                        "✅ [Node {}] All {} participants ready for presig session {}",
+                        self.node_id.0, expected_ready, session_id
+                    );
+                    all_ready = true;
+                    break;
+                }
+
+                debug!(
+                    "Waiting for participants: {}/{} ready for session {}",
+                    ready_count, expected_ready, session_id
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            }
+
+            if !all_ready {
+                warn!(
+                    "Timeout waiting for participants in presig session {}, proceeding anyway",
+                    session_id
+                );
+            }
+
             // Convert between ProtocolMessage and protocol-specific message types
+            // CRITICAL FIX: Store JoinHandles to abort tasks when protocol finishes
+            // This prevents messages from being sent after the session is unregistered
             let (protocol_incoming_tx, protocol_incoming_rx) = async_channel::bounded(100);
-            tokio::spawn(async move {
+            let incoming_task = tokio::spawn(async move {
                 while let Ok(proto_msg) = incoming_rx.recv().await {
                     match bincode::deserialize(&proto_msg.payload) {
                         Ok(msg) => {
@@ -419,7 +604,7 @@ impl PresignatureService {
             let node_id = self.node_id;
             let session_id_uuid = Uuid::parse_str(&session_id).unwrap();
             let participants_clone = participants_node_ids.clone();
-            tokio::spawn(async move {
+            let outgoing_task = tokio::spawn(async move {
                 let mut sequence = 0u64;
                 while let Ok(msg) = protocol_outgoing_rx.recv().await {
                     let payload = match bincode::serialize(&msg) {
@@ -461,8 +646,32 @@ impl PresignatureService {
             )
             .await;
 
+            // CRITICAL FIX: Abort forwarding tasks BEFORE unregistering session
+            // This prevents messages from being sent after session cleanup
+            incoming_task.abort();
+            outgoing_task.abort();
+
             if !result.success {
                 error!("Failed to generate presignature {}/{}: {:?}", i + 1, actual_count, result.error);
+                // FIX #6: Unregister session even on failure to prevent session leak
+                if let Err(e) = self.message_router.unregister_session(Uuid::parse_str(&session_id).unwrap()).await {
+                    warn!("Failed to unregister failed presignature session {}: {}", session_id, e);
+                }
+
+                // CRITICAL FIX: Clean up barrier keys on failure too
+                {
+                    let etcd = self.etcd.lock().await;
+                    for participant in &participants_node_ids {
+                        let key = format!("/presig/{}/ready/{}", session_id, participant.0);
+                        let _ = etcd.delete(&key).await;
+                    }
+                }
+
+                // CRITICAL FIX: Wait between failed sessions to allow QUIC messages to drain
+                // and participants to clean up their sessions. Without this delay,
+                // messages from the failed session interfere with the next session.
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
                 continue;
             }
 
@@ -508,6 +717,26 @@ impl PresignatureService {
             // }
 
             generated += 1;
+
+            // FIX #6: Unregister session after successful completion
+            // This prevents message collisions between sequential presignature sessions
+            if let Err(e) = self.message_router.unregister_session(Uuid::parse_str(&session_id).unwrap()).await {
+                warn!("Failed to unregister presignature session {}: {}", session_id, e);
+            }
+
+            // Clean up barrier keys from etcd
+            {
+                let etcd = self.etcd.lock().await;
+                for participant in &participants_node_ids {
+                    let key = format!("/presig/{}/ready/{}", session_id, participant.0);
+                    let _ = etcd.delete(&key).await; // Ignore errors during cleanup
+                }
+            }
+
+            // FIX #6: Delay between sessions to ensure cleanup completes
+            // This prevents overlapping QUIC messages between sequential sessions.
+            // CRITICAL: Must wait long enough for participants to also complete and unregister.
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
         }
 
         // NOTE: Lock is released in generate_batch() wrapper method
@@ -573,6 +802,257 @@ impl PresignatureService {
         }
     }
 
+    /// Join an existing presignature session as a participant (non-leader)
+    ///
+    /// SORUN #19 FIX #4: This method allows participant nodes to join a presignature
+    /// session initiated by a coordinator node. It:
+    /// 1. Registers the session with MessageRouter
+    /// 2. Loads aux_info and key_share
+    /// 3. Creates channel adapters for protocol communication
+    /// 4. Runs the presignature generation protocol
+    ///
+    /// This is called from /internal/presig-join endpoint when a participant node
+    /// receives a broadcast from the coordinator.
+    pub async fn join_presignature_session(
+        &self,
+        session_id: uuid::Uuid,
+        participants: Vec<NodeId>,
+    ) -> Result<()> {
+        // FIX: Acquire semaphore permit - only 1 presignature session at a time
+        // This prevents duplicate message errors when multiple sessions run in parallel
+        let _permit = self.presig_session_semaphore.acquire().await.map_err(|_| {
+            OrchestrationError::Internal("Failed to acquire presignature session permit".to_string())
+        })?;
+
+        info!(
+            "Joining presignature session {} with {} participants (acquired permit)",
+            session_id,
+            participants.len()
+        );
+
+        // Step 1: Register session with MessageRouter
+        let (outgoing_tx, incoming_rx) = self
+            .message_router
+            .register_session(
+                session_id,
+                RouterProtocolType::Presignature,
+                participants.clone(),
+            )
+            .await?;
+
+        info!(
+            "Registered presignature session {} with MessageRouter",
+            session_id
+        );
+
+        // ============================================================
+        // CRITICAL FIX: Signal ready to coordinator via etcd barrier
+        // ============================================================
+        // The coordinator waits for all participants to signal ready
+        // before starting the protocol. Without this, the coordinator
+        // may start sending messages before we're ready to receive them.
+        // ============================================================
+        let barrier_key = format!("/presig/{}/ready/{}", session_id, self.node_id.0);
+        {
+            let etcd = self.etcd.lock().await;
+            if let Err(e) = etcd.put(&barrier_key, &[1]).await {
+                error!("Failed to signal ready for presig session {}: {}", session_id, e);
+            } else {
+                info!(
+                    "✅ [Node {}] Signaled ready for presig session {}",
+                    self.node_id.0, session_id
+                );
+            }
+        }
+
+        // Step 2: Get aux_info and key_share
+        let (aux_info_session_id, aux_info_data) = self
+            .aux_info_service
+            .get_latest_aux_info()
+            .await
+            .ok_or_else(|| {
+                OrchestrationError::Internal(
+                    "No aux_info available. Run aux_info generation first.".to_string(),
+                )
+            })?;
+
+        info!(
+            "Using aux_info from session {} ({} bytes)",
+            aux_info_session_id,
+            aux_info_data.len()
+        );
+
+        let key_share_data = self
+            .postgres
+            .get_latest_key_share(self.node_id)
+            .await
+            .map_err(|e| {
+                OrchestrationError::StorageError(format!("Failed to get latest key_share: {}", e))
+            })?
+            .ok_or_else(|| {
+                OrchestrationError::StorageError(
+                    "No key_share found for this node. Run DKG ceremony first.".to_string(),
+                )
+            })?;
+
+        info!(
+            "Using latest key_share from DKG ceremony ({} bytes)",
+            key_share_data.len()
+        );
+
+        // Step 3: Convert NodeIDs to party indices
+        // NodeIDs are 1-indexed [1,2,3,4], party indices are 0-indexed [0,1,2,3]
+        let participants_party_indices: Vec<u16> = participants
+            .iter()
+            .map(|n| (n.0 - 1) as u16)
+            .collect();
+        let party_index = (self.node_id.0 - 1) as u16;
+
+        info!(
+            "Party index: {}, Participants: {:?}",
+            party_index, participants_party_indices
+        );
+
+        // Step 4: Create channel adapters
+        // Convert between ProtocolMessage (MessageRouter) and protocol-specific messages
+        // CRITICAL FIX: Store JoinHandles to abort tasks when protocol finishes
+        let (protocol_incoming_tx, protocol_incoming_rx) = async_channel::bounded(100);
+        let incoming_task = tokio::spawn(async move {
+            while let Ok(proto_msg) = incoming_rx.recv().await {
+                match bincode::deserialize(&proto_msg.payload) {
+                    Ok(msg) => {
+                        if protocol_incoming_tx.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to deserialize presignature message: {}",
+                            e
+                        );
+                    }
+                }
+            }
+        });
+
+        let (protocol_outgoing_tx, protocol_outgoing_rx) = async_channel::bounded(100);
+        let node_id = self.node_id;
+        let outgoing_task = tokio::spawn(async move {
+            let mut sequence = 0u64;
+            while let Ok(msg) = protocol_outgoing_rx.recv().await {
+                let payload = match bincode::serialize(&msg) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to serialize presignature message: {}",
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                for &participant in &participants {
+                    if participant != node_id {
+                        let proto_msg = RouterProtocolMessage {
+                            session_id,
+                            from: node_id,
+                            to: participant,
+                            payload: payload.clone(),
+                            sequence,
+                            is_broadcast: true,
+                        };
+                        if outgoing_tx.send(proto_msg).await.is_err() {
+                            tracing::error!(
+                                "Failed to send message to participant {}",
+                                participant
+                            );
+                        }
+                    }
+                }
+                sequence += 1;
+            }
+        });
+
+        // Step 5: Run the presignature generation protocol with TIMEOUT
+        // CRITICAL FIX: If coordinator fails, participants would wait forever for messages.
+        // Adding a 30 second timeout ensures we don't hold the semaphore permit forever.
+        info!(
+            "Running presignature protocol for session {} (30s timeout)",
+            session_id
+        );
+
+        let protocol_timeout = tokio::time::Duration::from_secs(30);
+        let result = match tokio::time::timeout(
+            protocol_timeout,
+            protocols::cggmp24::presignature::generate_presignature(
+                party_index,
+                &participants_party_indices,
+                &session_id.to_string(),
+                &key_share_data,
+                &aux_info_data,
+                protocol_incoming_rx,
+                protocol_outgoing_tx,
+            ),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                warn!(
+                    "Presignature protocol timed out after {:?} for session {}",
+                    protocol_timeout, session_id
+                );
+                protocols::cggmp24::presignature::PresignatureResult {
+                    success: false,
+                    presignature: None,
+                    error: Some(format!("Protocol timeout after {:?}", protocol_timeout)),
+                    duration_secs: protocol_timeout.as_secs_f64(),
+                }
+            }
+        };
+
+        // CRITICAL FIX: Abort forwarding tasks BEFORE unregistering session
+        // This prevents messages from being sent after session cleanup
+        incoming_task.abort();
+        outgoing_task.abort();
+
+        // FIX: Always unregister session after completion (success or failure)
+        // This prevents message collisions between sequential presignature sessions
+        let unregister_result = self.message_router.unregister_session(session_id).await;
+
+        // Clean up our barrier key from etcd (coordinator cleans up all keys)
+        {
+            let etcd = self.etcd.lock().await;
+            let barrier_key = format!("/presig/{}/ready/{}", session_id, self.node_id.0);
+            let _ = etcd.delete(&barrier_key).await; // Ignore errors during cleanup
+        }
+
+        if !result.success {
+            let error_msg = format!(
+                "Presignature protocol failed: {:?}",
+                result.error
+            );
+            error!("{}", error_msg);
+
+            if let Err(e) = unregister_result {
+                warn!("Failed to unregister failed presignature session {}: {}", session_id, e);
+            }
+
+            return Err(OrchestrationError::Protocol(error_msg));
+        }
+
+        if let Err(e) = unregister_result {
+            warn!("Failed to unregister completed presignature session {}: {}", session_id, e);
+        }
+
+        info!(
+            "Successfully completed presignature session {} (session unregistered)",
+            session_id
+        );
+
+        Ok(())
+    }
+
     /// Cleanup old unused presignatures (older than 24 hours)
     async fn cleanup_old_presignatures(&self) {
         let mut pool = self.pool.write().await;
@@ -608,11 +1088,15 @@ impl PresignatureService {
     /// Get CGGMP24 participants from DKG ceremony configuration
     ///
     /// Returns the list of party indices that should participate in presignature generation.
+    /// IMPORTANT: The coordinator (this node) MUST be included in the participants list.
     ///
     /// Reads DKG ceremony configuration from etcd to get participant count.
     async fn get_cggmp24_participants(&self) -> Result<Vec<u16>> {
         // Read DKG ceremony configuration from etcd
         let config_key = "/cluster/dkg/cggmp24/config";
+
+        // This node's party index (0-indexed)
+        let my_party_index = (self.node_id.0 - 1) as u16;
 
         let config_bytes = {
             let mut etcd = self.etcd.lock().await;
@@ -620,34 +1104,135 @@ impl PresignatureService {
                 .map_err(|e| OrchestrationError::Storage(e.into()))?
         };
 
-        if let Some(bytes) = config_bytes {
+        let (threshold, total_nodes) = if let Some(bytes) = config_bytes {
             // Parse configuration
             let config: serde_json::Value = serde_json::from_slice(&bytes)
                 .map_err(|e| OrchestrationError::Internal(format!("Failed to parse DKG config: {}", e)))?;
 
-            let total_nodes = config["total_nodes"].as_u64()
+            let total = config["total_nodes"].as_u64()
                 .ok_or_else(|| OrchestrationError::Internal("Missing total_nodes in DKG config".to_string()))? as u16;
 
-            let participants: Vec<u16> = (1..=total_nodes).collect();
+            let thresh = config["threshold"].as_u64()
+                .ok_or_else(|| OrchestrationError::Internal("Missing threshold in DKG config".to_string()))? as u16;
 
-            info!(
-                "CGGMP24 presignature participants from etcd config: {:?}",
-                participants
-            );
+            (thresh, total)
+        } else {
+            // Fallback: default configuration if etcd key not found
+            warn!("CGGMP24 DKG config not found in etcd, using default configuration");
+            (4u16, 5u16) // threshold=4, total_nodes=5
+        };
 
-            return Ok(participants);
+        // FIX: Build participant list that INCLUDES the coordinator (this node)
+        // CGGMP24 presignature requires EXACTLY threshold parties
+        // The coordinator MUST be in the list, otherwise "Party X is not in the presignature parties list" error
+
+        let mut participants: Vec<u16> = Vec::with_capacity(threshold as usize);
+
+        // Always include coordinator first
+        participants.push(my_party_index);
+
+        // Fill remaining slots with other parties (0 to total_nodes-1, excluding coordinator)
+        for i in 0..total_nodes {
+            if participants.len() >= threshold as usize {
+                break;
+            }
+            if i != my_party_index {
+                participants.push(i);
+            }
         }
 
-        // Fallback: default configuration if etcd key not found
-        warn!("CGGMP24 DKG config not found in etcd, using default configuration");
-        let participants: Vec<u16> = vec![1, 2, 3, 4];
+        // Sort for consistency
+        participants.sort();
 
         info!(
-            "CGGMP24 presignature participants (default config): {:?}",
-            participants
+            "CGGMP24 presignature participants: coordinator={}, threshold={}, total_nodes={}, participants={:?}",
+            my_party_index, threshold, total_nodes, participants
         );
 
         Ok(participants)
+    }
+
+    /// Broadcast presignature join request to all participant nodes (SORUN #19 FIX)
+    ///
+    /// This method broadcasts a presig-join request to all nodes that should participate
+    /// in the presignature generation, allowing them to register the session and handle
+    /// incoming QUIC protocol messages.
+    ///
+    /// Similar to DKG's broadcast_dkg_join_request().
+    async fn broadcast_presig_join_request(
+        &self,
+        session_id: Uuid,
+        participants: &[NodeId],
+    ) -> Result<()> {
+        use serde::{Deserialize, Serialize};
+        use std::time::Duration;
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct PresigJoinRequest {
+            session_id: String,
+            participants: Vec<u64>,
+        }
+
+        let participant_ids: Vec<u64> = participants.iter().map(|n| n.0).collect();
+
+        let join_request = PresigJoinRequest {
+            session_id: session_id.to_string(),
+            participants: participant_ids.clone(),
+        };
+
+        // Broadcast to all participant nodes except this node (coordinator)
+        let broadcast_futures: Vec<_> = participants
+            .iter()
+            .filter(|node_id| **node_id != self.node_id)
+            .filter_map(|node_id| {
+                // Get endpoint for this node
+                self.node_endpoints.get(&node_id.0).map(|endpoint| {
+                    let client = self.http_client.clone();
+                    let url = format!("{}/internal/presig-join", endpoint);
+                    let req = join_request.clone();
+                    let node_id = *node_id;
+
+                    async move {
+                        match client
+                            .post(&url)
+                            .json(&req)
+                            .timeout(Duration::from_secs(5))
+                            .send()
+                            .await
+                        {
+                            Ok(resp) if resp.status().is_success() => {
+                                info!("Presig join request sent to node {}", node_id.0);
+                                Ok(())
+                            }
+                            Ok(resp) => {
+                                warn!(
+                                    "Presig join request failed for node {}: status={}",
+                                    node_id.0,
+                                    resp.status()
+                                );
+                                Err(())
+                            }
+                            Err(e) => {
+                                error!("Failed to send presig join request to node {}: {}", node_id.0, e);
+                                Err(())
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        // Wait for all broadcasts (don't fail if some nodes are unreachable)
+        let results = futures::future::join_all(broadcast_futures).await;
+        let success_count = results.iter().filter(|r| r.is_ok()).count();
+
+        info!(
+            "Presig join request broadcast: {}/{} nodes reached",
+            success_count,
+            participants.len() - 1 // Exclude coordinator
+        );
+
+        Ok(())
     }
 }
 

@@ -61,6 +61,9 @@ pub enum OrchestrationError {
 
     #[error("Not implemented: {0}")]
     NotImplemented(String),
+
+    #[error("Session already exists: {0}")]
+    SessionAlreadyExists(String),
 }
 
 impl From<tokio::task::JoinError> for OrchestrationError {

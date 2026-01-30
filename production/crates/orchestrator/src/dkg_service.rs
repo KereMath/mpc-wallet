@@ -110,6 +110,8 @@ pub struct DkgCeremony {
     pub started_at: chrono::DateTime<Utc>,
     pub completed_at: Option<chrono::DateTime<Utc>>,
     pub public_key: Option<Vec<u8>>,
+    /// Bitcoin address derived from public key
+    pub address: Option<String>,
     pub error: Option<String>,
 }
 
@@ -123,6 +125,7 @@ impl DkgCeremony {
             total_nodes: self.total_nodes,
             status: format!("{:?}", self.status).to_lowercase(),
             public_key: self.public_key.clone(),
+            address: self.address.clone(),
             started_at: self.started_at,
             completed_at: self.completed_at,
             error: self.error.clone(),
@@ -155,6 +158,7 @@ impl DkgCeremony {
             started_at: storage.started_at,
             completed_at: storage.completed_at,
             public_key: storage.public_key,
+            address: storage.address,
             error: storage.error,
         }
     }
@@ -331,6 +335,7 @@ impl DkgService {
             started_at: Utc::now(),
             completed_at: None,
             public_key: None,
+            address: None,
             error: None,
         };
 
@@ -370,16 +375,20 @@ impl DkgService {
 
         match result {
             Ok(public_key) => {
+                // Derive Bitcoin address first
+                let address = self.derive_address(protocol, &public_key)?;
+
                 // Update ceremony status to completed
                 let mut ceremonies = self.active_ceremonies.write().await;
                 if let Some(ceremony) = ceremonies.get_mut(&session_id) {
                     ceremony.status = DkgStatus::Completed;
                     ceremony.completed_at = Some(Utc::now());
                     ceremony.public_key = Some(public_key.clone());
+                    ceremony.address = Some(address.clone());
 
                     // Update PostgreSQL
                     self.postgres
-                        .complete_dkg_ceremony(session_id, &public_key)
+                        .complete_dkg_ceremony(session_id, &public_key, &address)
                         .await
                         .map_err(|e| {
                             OrchestrationError::StorageError(format!(
@@ -388,9 +397,6 @@ impl DkgService {
                             ))
                         })?;
                 }
-
-                // Derive Bitcoin address
-                let address = self.derive_address(protocol, &public_key)?;
 
                 // Store public key in etcd for cluster-wide access
                 let pubkey_key = format!("/cluster/public_keys/{}", protocol);
@@ -588,10 +594,41 @@ impl DkgService {
         info!("Joining DKG ceremony: session_id={}", session_id);
 
         // Read ceremony details from PostgreSQL (created by coordinator)
-        let ceremony_data = self.postgres
-            .get_dkg_ceremony(session_id)
-            .await
-            .map_err(|e| OrchestrationError::StorageError(format!("Ceremony not found: {}", e)))?;
+        // RACE CONDITION FIX: Retry with backoff because the coordinator's PostgreSQL
+        // write might not be visible to participants immediately after HTTP broadcast.
+        let mut ceremony_data = None;
+        let max_retries = 10;
+        let retry_delay = tokio::time::Duration::from_millis(200);
+
+        for attempt in 1..=max_retries {
+            match self.postgres.get_dkg_ceremony(session_id).await {
+                Ok(data) => {
+                    ceremony_data = Some(data);
+                    if attempt > 1 {
+                        info!("Found DKG ceremony on attempt {}", attempt);
+                    }
+                    break;
+                }
+                Err(e) => {
+                    if attempt < max_retries {
+                        warn!(
+                            "DKG ceremony not found (attempt {}/{}), retrying in {:?}: {}",
+                            attempt, max_retries, retry_delay, e
+                        );
+                        tokio::time::sleep(retry_delay).await;
+                    } else {
+                        return Err(OrchestrationError::StorageError(format!(
+                            "Ceremony not found after {} attempts: {}",
+                            max_retries, e
+                        )));
+                    }
+                }
+            }
+        }
+
+        let ceremony_data = ceremony_data.ok_or_else(|| {
+            OrchestrationError::StorageError("Ceremony not found".to_string())
+        })?;
 
         // Parse protocol type
         let protocol = match ceremony_data.protocol.as_str() {
@@ -624,6 +661,7 @@ impl DkgService {
                 started_at: ceremony_data.started_at,
                 completed_at: None,
                 public_key: None,
+                address: None,
                 error: None,
             });
         }
@@ -636,16 +674,17 @@ impl DkgService {
 
         match result {
             Ok(public_key) => {
+                // Derive Bitcoin address first
+                let address = self.derive_address(protocol, &public_key)?;
+
                 // Update ceremony status to completed
                 let mut ceremonies = self.active_ceremonies.write().await;
                 if let Some(ceremony) = ceremonies.get_mut(&session_id) {
                     ceremony.status = DkgStatus::Completed;
                     ceremony.completed_at = Some(Utc::now());
                     ceremony.public_key = Some(public_key.clone());
+                    ceremony.address = Some(address.clone());
                 }
-
-                // Derive Bitcoin address
-                let address = self.derive_address(protocol, &public_key)?;
 
                 Ok(DkgResult {
                     session_id,

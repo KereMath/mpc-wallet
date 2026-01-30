@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use threshold_bitcoin::BitcoinClient;
-use threshold_orchestrator::{DkgService, AuxInfoService};
+use threshold_orchestrator::{DkgService, AuxInfoService, PresignatureService, MessageRouter};
 use threshold_storage::{EtcdStorage, PostgresStorage};
 use threshold_types::VoteRequest;
 
@@ -20,6 +20,10 @@ pub struct AppState {
     pub dkg_service: Arc<DkgService>,
     /// Aux info service for auxiliary information generation
     pub aux_info_service: Arc<AuxInfoService>,
+    /// Presignature service for fast signing (SORUN #19 FIX)
+    pub presig_service: Arc<PresignatureService>,
+    /// Message router for protocol communication (SORUN #19 FIX)
+    pub message_router: Arc<MessageRouter>,
     /// Channel to trigger automatic voting
     pub vote_trigger: mpsc::Sender<VoteRequest>,
 }
@@ -32,6 +36,8 @@ impl AppState {
         bitcoin: BitcoinClient,
         dkg_service: Arc<DkgService>,
         aux_info_service: Arc<AuxInfoService>,
+        presig_service: Arc<PresignatureService>,
+        message_router: Arc<MessageRouter>,
         vote_trigger: mpsc::Sender<VoteRequest>,
     ) -> Self {
         Self {
@@ -40,6 +46,8 @@ impl AppState {
             bitcoin: Arc::new(bitcoin),
             dkg_service,
             aux_info_service,
+            presig_service,
+            message_router,
             vote_trigger,
         }
     }

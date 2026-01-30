@@ -111,12 +111,28 @@ impl MessageRouter {
     /// Register a new protocol session
     ///
     /// Returns (incoming_tx, outgoing_rx) for the protocol to use
+    ///
+    /// FIX SORUN #14: Prevent duplicate session registration
+    /// If a session with the same ID already exists, return an error instead of
+    /// overwriting it. This prevents message collisions between duplicate sessions.
     pub async fn register_session(
         &self,
         session_id: Uuid,
         protocol_type: ProtocolType,
         participants: Vec<NodeId>,
     ) -> Result<(Sender<ProtocolMessage>, Receiver<ProtocolMessage>)> {
+        // FIX: Check for duplicate session registration
+        {
+            let sessions = self.active_sessions.read().await;
+            if sessions.contains_key(&session_id) {
+                warn!(
+                    "Attempted to register duplicate {} session {}, rejecting",
+                    protocol_type, session_id
+                );
+                return Err(OrchestrationError::SessionAlreadyExists(session_id.to_string()));
+            }
+        }
+
         // Create channels for this session
         // SORUN #16 FIX: Increased buffer size to prevent backpressure hangs
         let (incoming_tx, incoming_rx) = async_channel::bounded(1000);
@@ -134,6 +150,14 @@ impl MessageRouter {
 
         {
             let mut sessions = self.active_sessions.write().await;
+            // Double-check after acquiring write lock (TOCTOU prevention)
+            if sessions.contains_key(&session_id) {
+                warn!(
+                    "Race condition: duplicate {} session {} detected after lock",
+                    protocol_type, session_id
+                );
+                return Err(OrchestrationError::SessionAlreadyExists(session_id.to_string()));
+            }
             sessions.insert(session_id, session);
         }
 
@@ -148,6 +172,12 @@ impl MessageRouter {
         self.start_routing_tasks(session_id).await?;
 
         Ok((outgoing_tx, incoming_rx))
+    }
+
+    /// Check if a session is already registered
+    pub async fn is_session_registered(&self, session_id: Uuid) -> bool {
+        let sessions = self.active_sessions.read().await;
+        sessions.contains_key(&session_id)
     }
 
     /// Unregister a protocol session

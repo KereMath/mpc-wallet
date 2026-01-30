@@ -59,7 +59,7 @@ pub mod tx_builder;
 pub mod types;
 
 // Re-export main types for convenience
-pub use client::{BitcoinClient, BitcoinError, BitcoinNetwork};
+pub use client::{Balance, BitcoinClient, BitcoinError, BitcoinNetwork};
 pub use tx_builder::{
     finalize_p2wpkh_transaction, finalize_taproot_transaction, TransactionBuilder,
     TxBuilderError, DUST_LIMIT, MAX_OP_RETURN_SIZE,

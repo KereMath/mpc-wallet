@@ -910,7 +910,7 @@ impl PostgresStorage {
     }
 
     /// Mark DKG ceremony as completed
-    pub async fn complete_dkg_ceremony(&self, session_id: uuid::Uuid, public_key: &[u8]) -> Result<()> {
+    pub async fn complete_dkg_ceremony(&self, session_id: uuid::Uuid, public_key: &[u8], address: &str) -> Result<()> {
         let client = self
             .pool
             .get()
@@ -921,15 +921,15 @@ impl PostgresStorage {
             .execute(
                 r#"
                 UPDATE dkg_ceremonies
-                SET status = 'completed', public_key = $1, completed_at = NOW()
-                WHERE session_id = $2
+                SET status = 'completed', public_key = $1, address = $2, completed_at = NOW()
+                WHERE session_id = $3
                 "#,
-                &[&public_key, &session_id.to_string()],
+                &[&public_key, &address, &session_id.to_string()],
             )
             .await
             .map_err(|e| Error::StorageError(format!("Failed to complete DKG ceremony: {}", e)))?;
 
-        info!("Completed DKG ceremony: session_id={}", session_id);
+        info!("Completed DKG ceremony: session_id={} address={}", session_id, address);
 
         Ok(())
     }
@@ -971,7 +971,7 @@ impl PostgresStorage {
             .query_one(
                 r#"
                 SELECT session_id, protocol, threshold, total_nodes, status,
-                       public_key, started_at, completed_at, error
+                       public_key, address, started_at, completed_at, error
                 FROM dkg_ceremonies
                 WHERE session_id = $1
                 "#,
@@ -986,9 +986,10 @@ impl PostgresStorage {
         let total_nodes: i32 = row.get(3);
         let status: String = row.get(4);
         let public_key: Option<Vec<u8>> = row.get(5);
-        let started_at: chrono::DateTime<chrono::Utc> = row.get(6);
-        let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get(7);
-        let error: Option<String> = row.get(8);
+        let address: Option<String> = row.get(6);
+        let started_at: chrono::DateTime<chrono::Utc> = row.get(7);
+        let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get(8);
+        let error: Option<String> = row.get(9);
 
         Ok(crate::DkgCeremony {
             session_id: uuid::Uuid::parse_str(&session_id_str)
@@ -998,6 +999,7 @@ impl PostgresStorage {
             total_nodes: total_nodes as u32,
             status,
             public_key,
+            address,
             started_at,
             completed_at,
             error,
@@ -1012,10 +1014,11 @@ impl PostgresStorage {
             .await
             .map_err(|e| Error::StorageError(format!("Failed to get client: {}", e)))?;
 
-        let _rows = client
+        let rows = client
             .query(
                 r#"
-                SELECT session_id, protocol, threshold, total_nodes, status, started_at, completed_at, public_key
+                SELECT session_id, protocol, threshold, total_nodes, status,
+                       public_key, address, started_at, completed_at, error
                 FROM dkg_ceremonies
                 ORDER BY started_at DESC
                 "#,
@@ -1024,10 +1027,36 @@ impl PostgresStorage {
             .await
             .map_err(|e| Error::StorageError(format!("Failed to list DKG ceremonies: {}", e)))?;
 
-        // Note: This is a placeholder - we need to import the DkgCeremony type properly
-        // For now, returning empty vector to avoid compilation errors
-        warn!("list_dkg_ceremonies not fully implemented - need to define DkgCeremony type in storage crate");
-        Ok(Vec::new())
+        let mut ceremonies = Vec::new();
+        for row in rows {
+            let session_id_str: String = row.get(0);
+            let protocol: String = row.get(1);
+            let threshold: i32 = row.get(2);
+            let total_nodes: i32 = row.get(3);
+            let status: String = row.get(4);
+            let public_key: Option<Vec<u8>> = row.get(5);
+            let address: Option<String> = row.get(6);
+            let started_at: chrono::DateTime<chrono::Utc> = row.get(7);
+            let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get(8);
+            let error: Option<String> = row.get(9);
+
+            if let Ok(session_id) = uuid::Uuid::parse_str(&session_id_str) {
+                ceremonies.push(crate::DkgCeremony {
+                    session_id,
+                    protocol,
+                    threshold: threshold as u32,
+                    total_nodes: total_nodes as u32,
+                    status,
+                    public_key,
+                    address,
+                    started_at,
+                    completed_at,
+                    error,
+                });
+            }
+        }
+
+        Ok(ceremonies)
     }
 
     /// Store encrypted key share for a node
