@@ -123,7 +123,8 @@
       "Bash(Start-Sleep -Seconds 20)",
       "Bash(timeout:*)",
       "Bash(npm install:*)",
-      "Bash(npm run build:*)"
+      "Bash(npm run build:*)",
+      "Bash(findstr:*)"
     ]
   }
 }

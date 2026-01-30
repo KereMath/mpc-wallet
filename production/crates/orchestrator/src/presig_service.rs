@@ -586,7 +586,19 @@ impl PresignatureService {
             // This prevents messages from being sent after the session is unregistered
             let (protocol_incoming_tx, protocol_incoming_rx) = async_channel::bounded(100);
             let incoming_task = tokio::spawn(async move {
+                // DEDUPLICATION FIX: Track seen messages by (sender, sequence) to prevent
+                // AttemptToOverwriteReceivedMsg errors from duplicate/late messages
+                let mut seen_messages: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+
                 while let Ok(proto_msg) = incoming_rx.recv().await {
+                    // Dedup key: (sender node_id, sequence)
+                    let dedup_key = (proto_msg.from.0, proto_msg.sequence);
+                    if seen_messages.contains(&dedup_key) {
+                        // Silently drop duplicate message
+                        continue;
+                    }
+                    seen_messages.insert(dedup_key);
+
                     match bincode::deserialize(&proto_msg.payload) {
                         Ok(msg) => {
                             if protocol_incoming_tx.send(msg).await.is_err() {
@@ -918,7 +930,19 @@ impl PresignatureService {
         // CRITICAL FIX: Store JoinHandles to abort tasks when protocol finishes
         let (protocol_incoming_tx, protocol_incoming_rx) = async_channel::bounded(100);
         let incoming_task = tokio::spawn(async move {
+            // DEDUPLICATION FIX: Track seen messages by (sender, sequence) to prevent
+            // AttemptToOverwriteReceivedMsg errors from duplicate/late messages
+            let mut seen_messages: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+
             while let Ok(proto_msg) = incoming_rx.recv().await {
+                // Dedup key: (sender node_id, sequence)
+                let dedup_key = (proto_msg.from.0, proto_msg.sequence);
+                if seen_messages.contains(&dedup_key) {
+                    // Silently drop duplicate message
+                    continue;
+                }
+                seen_messages.insert(dedup_key);
+
                 match bincode::deserialize(&proto_msg.payload) {
                     Ok(msg) => {
                         if protocol_incoming_tx.send(msg).await.is_err() {

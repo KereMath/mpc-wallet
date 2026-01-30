@@ -378,8 +378,9 @@ pub async fn run_aux_info_gen(
     // Aux info generation can take up to 60 seconds for 5 parties
     info!("Starting aux_info_gen protocol (60s timeout)...");
     let protocol_timeout = std::time::Duration::from_secs(60);
+    let mut rng = OsRng;
     let aux_future = cggmp24::aux_info_gen(eid, party_index, num_parties, primes)
-        .start(&mut OsRng, party);
+        .start(&mut rng, party);
 
     let result = match tokio::time::timeout(protocol_timeout, aux_future).await {
         Ok(r) => r,

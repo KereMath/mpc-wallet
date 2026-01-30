@@ -305,6 +305,8 @@ pub enum NetworkMessage {
         to: NodeId,
         payload: Vec<u8>,
         is_broadcast: bool,
+        /// Message sequence number for deduplication and ordering
+        sequence: u64,
     },
 }
 

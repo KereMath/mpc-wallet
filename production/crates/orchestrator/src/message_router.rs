@@ -266,6 +266,7 @@ impl MessageRouter {
                         to: msg.to,
                         payload: msg.payload.clone(),
                         is_broadcast: msg.is_broadcast,
+                        sequence: msg.sequence,
                     };
 
                     // Use stream ID based on session ID hash for consistency
@@ -388,6 +389,7 @@ impl MessageRouter {
                     to: message.to,
                     payload: message.payload.clone(),
                     is_broadcast: message.is_broadcast,
+                    sequence: message.sequence,
                 };
 
                 let stream_id = session_id.as_u128() as u64;

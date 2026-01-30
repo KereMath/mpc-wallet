@@ -130,9 +130,8 @@ async fn main() -> Result<()> {
     let message_router_clone = Arc::clone(&message_router);
     let _listener_handle = quic_engine.start_listener(move |sender_node_id, network_message| {
         // Dispatch incoming QUIC messages to MessageRouter
-        if let threshold_types::NetworkMessage::Protocol { session_id, from, to, payload, is_broadcast } = network_message {
+        if let threshold_types::NetworkMessage::Protocol { session_id, from, to, payload, is_broadcast, sequence } = network_message {
             let session_id_str = session_id;
-            let sequence = 0; // QUIC layer doesn't track sequence, protocol layer does
 
             // Spawn async task to handle the message
             let router = Arc::clone(&message_router_clone);
