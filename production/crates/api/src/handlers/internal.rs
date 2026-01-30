@@ -226,3 +226,26 @@ pub async fn receive_signing_join_request(
 
     Ok(Json("Signing join request received"))
 }
+
+/// Response for aux-ready check
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuxReadyResponse {
+    pub ready: bool,
+    pub node_id: u64,
+}
+
+/// Check if this node has aux_info ready for presignature generation
+///
+/// GET /internal/aux-ready
+///
+/// Used by coordinator to verify all participants have aux_info before starting presig
+pub async fn check_aux_ready(
+    State(state): State<AppState>,
+) -> Result<Json<AuxReadyResponse>, ApiError> {
+    let has_aux_info = state.aux_info_service.get_latest_aux_info().await.is_some();
+
+    Ok(Json(AuxReadyResponse {
+        ready: has_aux_info,
+        node_id: state.node_id.0,
+    }))
+}

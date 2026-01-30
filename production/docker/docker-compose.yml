@@ -172,6 +172,8 @@ services:
     volumes:
       - ${CERTS_PATH:?CERTS_PATH must be set}:/certs:ro
       - node-1-data:/data
+      # Primes for CGGMP24 aux_info generation (party index = node_id - 1)
+      - ../data/primes-party-0.json:/data/primes-party-0.json:ro
     healthcheck:
       test: ["CMD", "/app/healthcheck.sh"]
       interval: 30s
@@ -230,6 +232,8 @@ services:
     volumes:
       - ${CERTS_PATH:?CERTS_PATH must be set}:/certs:ro
       - node-2-data:/data
+      # Primes for CGGMP24 aux_info generation (party index = node_id - 1)
+      - ../data/primes-party-1.json:/data/primes-party-1.json:ro
     healthcheck:
       test: ["CMD", "/app/healthcheck.sh"]
       interval: 30s
@@ -288,6 +292,8 @@ services:
     volumes:
       - ${CERTS_PATH:?CERTS_PATH must be set}:/certs:ro
       - node-3-data:/data
+      # Primes for CGGMP24 aux_info generation (party index = node_id - 1)
+      - ../data/primes-party-2.json:/data/primes-party-2.json:ro
     healthcheck:
       test: ["CMD", "/app/healthcheck.sh"]
       interval: 30s
@@ -346,6 +352,8 @@ services:
     volumes:
       - ${CERTS_PATH:?CERTS_PATH must be set}:/certs:ro
       - node-4-data:/data
+      # Primes for CGGMP24 aux_info generation (party index = node_id - 1)
+      - ../data/primes-party-3.json:/data/primes-party-3.json:ro
     healthcheck:
       test: ["CMD", "/app/healthcheck.sh"]
       interval: 30s
@@ -404,6 +412,8 @@ services:
     volumes:
       - ${CERTS_PATH:?CERTS_PATH must be set}:/certs:ro
       - node-5-data:/data
+      # Primes for CGGMP24 aux_info generation (party index = node_id - 1)
+      - ../data/primes-party-4.json:/data/primes-party-4.json:ro
     healthcheck:
       test: ["CMD", "/app/healthcheck.sh"]
       interval: 30s

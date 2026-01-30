@@ -275,45 +275,18 @@ impl PresignatureService {
 
     /// Check if this node should be the presignature generation leader
     ///
-    /// Leader election rule: The LOWEST numbered node that is active becomes leader.
-    /// This ensures only ONE node attempts to generate presignatures at a time.
+    /// SIMPLIFIED RULE: Only Node 1 is EVER the presignature leader.
+    /// This eliminates race conditions and ensures deterministic coordination.
+    /// Other nodes only participate when invited via join_presignature_session.
     ///
-    /// Returns: true if this node should attempt generation, false otherwise
+    /// Returns: true if this is Node 1, false otherwise
     async fn should_be_presig_leader(&self) -> Result<bool> {
-        // Get active nodes from etcd by checking heartbeats
-        let active_nodes: Vec<u64> = {
-            let mut etcd = self.etcd.lock().await;
-            match etcd.get_active_nodes().await {
-                Ok(nodes) => nodes.into_iter().map(|n| n.0).collect(),
-                Err(e) => {
-                    warn!("Failed to get active nodes from etcd: {}", e);
-                    // Fallback: assume all configured nodes are active
-                    // Only node 1 should attempt in this case
-                    return Ok(self.node_id.0 == 1);
-                }
-            }
-        };
-
-        if active_nodes.is_empty() {
-            // No active nodes found - only node 1 should be leader to avoid conflicts
-            if self.node_id.0 == 1 {
-                info!("No active nodes in etcd, node 1 is leader by default");
-                return Ok(true);
-            } else {
-                debug!("No active nodes in etcd, node {} deferring to node 1", self.node_id.0);
-                return Ok(false);
-            }
-        }
-
-        // Find the lowest active node ID
-        let min_active_node = active_nodes.iter().min().copied().unwrap_or(1);
-
-        let is_leader = self.node_id.0 == min_active_node;
+        // SIMPLE RULE: Only Node 1 is ever the leader
+        // This prevents race conditions where multiple nodes try to coordinate
+        let is_leader = self.node_id.0 == 1;
 
         if is_leader {
-            debug!("Node {} is presig leader (lowest of {:?})", self.node_id.0, active_nodes);
-        } else {
-            debug!("Node {} is not leader (leader is node {})", self.node_id.0, min_active_node);
+            debug!("Node 1 is the designated presig leader");
         }
 
         Ok(is_leader)
@@ -503,6 +476,42 @@ impl PresignatureService {
                 }
             };
 
+            // ============================================================
+            // CRITICAL FIX: Check all participants have aux_info before starting
+            // ============================================================
+            // This prevents the race condition where we broadcast join requests
+            // to nodes that haven't finished their aux_info generation yet.
+            // Without this check, participants fail with "No aux_info available"
+            // and the coordinator times out waiting for their protocol messages.
+            // ============================================================
+            match self.check_all_participants_aux_ready(&participants_node_ids).await {
+                Ok(true) => {
+                    info!(
+                        "All {} participants have aux_info ready",
+                        participants_node_ids.len()
+                    );
+                }
+                Ok(false) => {
+                    warn!(
+                        "Not all participants have aux_info ready, skipping presig generation"
+                    );
+                    // Unregister the session we just registered
+                    let _ = self.message_router
+                        .unregister_session(Uuid::parse_str(&session_id).unwrap())
+                        .await;
+                    // Skip this generation cycle - try again in next iteration
+                    continue;
+                }
+                Err(e) => {
+                    warn!("Failed to check participant aux_info readiness: {}", e);
+                    // Conservative approach: skip if we can't verify
+                    let _ = self.message_router
+                        .unregister_session(Uuid::parse_str(&session_id).unwrap())
+                        .await;
+                    continue;
+                }
+            }
+
             // SORUN #19 FIX: Broadcast presig-join request to all participant nodes
             // This allows other nodes to register the session and handle QUIC messages
             if let Err(e) = self
@@ -575,10 +584,28 @@ impl PresignatureService {
             }
 
             if !all_ready {
-                warn!(
-                    "Timeout waiting for participants in presig session {}, proceeding anyway",
+                error!(
+                    "Timeout waiting for participants in presig session {} - aborting to prevent message corruption",
                     session_id
                 );
+                // CRITICAL FIX: Do NOT proceed if participants aren't ready!
+                // Proceeding anyway causes AttemptToOverwriteReceivedMsg errors because:
+                // 1. Messages are sent to nodes that haven't registered the session
+                // 2. Those messages are dropped as "unknown session"
+                // 3. Protocol fails due to missing messages
+                // 4. On retry, stale messages from failed sessions cause corruption
+                let _ = self.message_router
+                    .unregister_session(Uuid::parse_str(&session_id).unwrap())
+                    .await;
+                // Clean up barrier keys
+                {
+                    let etcd = self.etcd.lock().await;
+                    for participant in &participants_node_ids {
+                        let key = format!("/presig/{}/ready/{}", session_id, participant.0);
+                        let _ = etcd.delete(&key).await;
+                    }
+                }
+                continue; // Skip this session and try again in next cycle
             }
 
             // Convert between ProtocolMessage and protocol-specific message types
@@ -586,28 +613,47 @@ impl PresignatureService {
             // This prevents messages from being sent after the session is unregistered
             let (protocol_incoming_tx, protocol_incoming_rx) = async_channel::bounded(100);
             let incoming_task = tokio::spawn(async move {
-                // DEDUPLICATION FIX: Track seen messages by (sender, sequence) to prevent
-                // AttemptToOverwriteReceivedMsg errors from duplicate/late messages
-                let mut seen_messages: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+                // CONTENT-BASED DEDUPLICATION: Track seen messages by hash(sender + inner_payload)
+                // CRITICAL: We must hash the INNER payload, not the serialized ProtocolMessage,
+                // because ProtocolMessage includes `seq` which differs for retransmissions.
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut seen_payload_hashes: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
                 while let Ok(proto_msg) = incoming_rx.recv().await {
-                    // Dedup key: (sender node_id, sequence)
-                    let dedup_key = (proto_msg.from.0, proto_msg.sequence);
-                    if seen_messages.contains(&dedup_key) {
-                        // Silently drop duplicate message
+                    // First deserialize to get the ProtocolMessage
+                    let protocol_msg: protocols::cggmp24::runner::ProtocolMessage =
+                        match bincode::deserialize(&proto_msg.payload) {
+                            Ok(msg) => msg,
+                            Err(e) => {
+                                tracing::error!("Failed to deserialize presignature message: {}", e);
+                                continue;
+                            }
+                        };
+
+                    // Hash the INNER payload (sender + payload, excluding seq!)
+                    // This catches duplicates even if they have different sequence numbers
+                    let mut hasher = DefaultHasher::new();
+                    protocol_msg.sender.hash(&mut hasher);
+                    protocol_msg.payload.hash(&mut hasher);
+                    let payload_hash = hasher.finish();
+
+                    if !seen_payload_hashes.insert(payload_hash) {
+                        // Already seen this exact message content - drop silently
+                        tracing::warn!(
+                            "🚫 DROPPING DUPLICATE: sender={}, hash={}, seq={}, payload_len={}",
+                            protocol_msg.sender, payload_hash, protocol_msg.seq, protocol_msg.payload.len()
+                        );
                         continue;
                     }
-                    seen_messages.insert(dedup_key);
 
-                    match bincode::deserialize(&proto_msg.payload) {
-                        Ok(msg) => {
-                            if protocol_incoming_tx.send(msg).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to deserialize presignature message: {}", e);
-                        }
+                    tracing::warn!(
+                        "✅ PASSING MSG: sender={}, hash={}, seq={}, round={}, payload_len={}",
+                        protocol_msg.sender, payload_hash, protocol_msg.seq, protocol_msg.round, protocol_msg.payload.len()
+                    );
+
+                    if protocol_incoming_tx.send(protocol_msg).await.is_err() {
+                        break;
                     }
                 }
             });
@@ -842,6 +888,23 @@ impl PresignatureService {
             participants.len()
         );
 
+        // ============================================================
+        // CRITICAL FIX: Check aux_info BEFORE registering session
+        // ============================================================
+        // This must happen BEFORE signaling ready to prevent race condition
+        // where we signal ready but then fail on aux_info check, causing
+        // coordinator to timeout waiting for our protocol messages.
+        // ============================================================
+        let (aux_info_session_id, aux_info_data) = self
+            .aux_info_service
+            .get_latest_aux_info()
+            .await
+            .ok_or_else(|| {
+                OrchestrationError::Internal(
+                    "No aux_info available. Run aux_info generation first.".to_string(),
+                )
+            })?;
+
         // Step 1: Register session with MessageRouter
         let (outgoing_tx, incoming_rx) = self
             .message_router
@@ -861,8 +924,8 @@ impl PresignatureService {
         // CRITICAL FIX: Signal ready to coordinator via etcd barrier
         // ============================================================
         // The coordinator waits for all participants to signal ready
-        // before starting the protocol. Without this, the coordinator
-        // may start sending messages before we're ready to receive them.
+        // before starting the protocol. Now we signal AFTER confirming
+        // aux_info is available, so we won't fail after signaling.
         // ============================================================
         let barrier_key = format!("/presig/{}/ready/{}", session_id, self.node_id.0);
         {
@@ -877,16 +940,7 @@ impl PresignatureService {
             }
         }
 
-        // Step 2: Get aux_info and key_share
-        let (aux_info_session_id, aux_info_data) = self
-            .aux_info_service
-            .get_latest_aux_info()
-            .await
-            .ok_or_else(|| {
-                OrchestrationError::Internal(
-                    "No aux_info available. Run aux_info generation first.".to_string(),
-                )
-            })?;
+        // Step 2: Get aux_info (already loaded above) and key_share
 
         info!(
             "Using aux_info from session {} ({} bytes)",
@@ -930,31 +984,47 @@ impl PresignatureService {
         // CRITICAL FIX: Store JoinHandles to abort tasks when protocol finishes
         let (protocol_incoming_tx, protocol_incoming_rx) = async_channel::bounded(100);
         let incoming_task = tokio::spawn(async move {
-            // DEDUPLICATION FIX: Track seen messages by (sender, sequence) to prevent
-            // AttemptToOverwriteReceivedMsg errors from duplicate/late messages
-            let mut seen_messages: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+            // CONTENT-BASED DEDUPLICATION: Track seen messages by hash(sender + inner_payload)
+            // CRITICAL: We must hash the INNER payload, not the serialized ProtocolMessage,
+            // because ProtocolMessage includes `seq` which differs for retransmissions.
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut seen_payload_hashes: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
             while let Ok(proto_msg) = incoming_rx.recv().await {
-                // Dedup key: (sender node_id, sequence)
-                let dedup_key = (proto_msg.from.0, proto_msg.sequence);
-                if seen_messages.contains(&dedup_key) {
-                    // Silently drop duplicate message
+                // First deserialize to get the ProtocolMessage
+                let protocol_msg: protocols::cggmp24::runner::ProtocolMessage =
+                    match bincode::deserialize(&proto_msg.payload) {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            tracing::error!("Failed to deserialize presignature message: {}", e);
+                            continue;
+                        }
+                    };
+
+                // Hash the INNER payload (sender + payload, excluding seq!)
+                // This catches duplicates even if they have different sequence numbers
+                let mut hasher = DefaultHasher::new();
+                protocol_msg.sender.hash(&mut hasher);
+                protocol_msg.payload.hash(&mut hasher);
+                let payload_hash = hasher.finish();
+
+                if !seen_payload_hashes.insert(payload_hash) {
+                    // Already seen this exact message content - drop silently
+                    tracing::warn!(
+                        "🚫 DROPPING DUPLICATE (join): sender={}, hash={}, seq={}, payload_len={}",
+                        protocol_msg.sender, payload_hash, protocol_msg.seq, protocol_msg.payload.len()
+                    );
                     continue;
                 }
-                seen_messages.insert(dedup_key);
 
-                match bincode::deserialize(&proto_msg.payload) {
-                    Ok(msg) => {
-                        if protocol_incoming_tx.send(msg).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to deserialize presignature message: {}",
-                            e
-                        );
-                    }
+                tracing::warn!(
+                    "✅ PASSING MSG (join): sender={}, hash={}, seq={}, round={}, payload_len={}",
+                    protocol_msg.sender, payload_hash, protocol_msg.seq, protocol_msg.round, protocol_msg.payload.len()
+                );
+
+                if protocol_incoming_tx.send(protocol_msg).await.is_err() {
+                    break;
                 }
             }
         });
@@ -1174,6 +1244,102 @@ impl PresignatureService {
         );
 
         Ok(participants)
+    }
+
+    /// Check if all participant nodes have aux_info ready
+    ///
+    /// This prevents the race condition where coordinator starts presig before
+    /// other nodes have completed their aux_info generation.
+    ///
+    /// Returns Ok(true) if all nodes are ready, Ok(false) if not all ready,
+    /// or Err if there's a communication error.
+    async fn check_all_participants_aux_ready(
+        &self,
+        participants: &[NodeId],
+    ) -> Result<bool> {
+        use serde::Deserialize;
+        use std::time::Duration;
+
+        #[derive(Debug, Deserialize)]
+        struct AuxReadyResponse {
+            ready: bool,
+            node_id: u64,
+        }
+
+        // Check all participant nodes (including self)
+        let check_futures: Vec<_> = participants
+            .iter()
+            .filter_map(|node_id| {
+                // Get endpoint for this node
+                self.node_endpoints.get(&node_id.0).map(|endpoint| {
+                    let client = self.http_client.clone();
+                    let url = format!("{}/internal/aux-ready", endpoint);
+                    let node_id = *node_id;
+
+                    async move {
+                        match client
+                            .get(&url)
+                            .timeout(Duration::from_secs(2))
+                            .send()
+                            .await
+                        {
+                            Ok(resp) if resp.status().is_success() => {
+                                match resp.json::<AuxReadyResponse>().await {
+                                    Ok(r) => {
+                                        if !r.ready {
+                                            info!(
+                                                "Node {} does not have aux_info ready yet",
+                                                node_id.0
+                                            );
+                                        }
+                                        Ok(r.ready)
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to parse aux-ready response from node {}: {}",
+                                            node_id.0, e
+                                        );
+                                        Err(())
+                                    }
+                                }
+                            }
+                            Ok(resp) => {
+                                warn!(
+                                    "Aux-ready check failed for node {}: status={}",
+                                    node_id.0,
+                                    resp.status()
+                                );
+                                Err(())
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to check aux-ready on node {}: {}",
+                                    node_id.0, e
+                                );
+                                Err(())
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        // Wait for all checks
+        let results = futures::future::join_all(check_futures).await;
+
+        // All must be ready (Ok(true)) for us to proceed
+        let all_ready = results.iter().all(|r| matches!(r, Ok(true)));
+        let ready_count = results.iter().filter(|r| matches!(r, Ok(true))).count();
+
+        if !all_ready {
+            info!(
+                "Not all participants ready for presig: {}/{} have aux_info",
+                ready_count,
+                participants.len()
+            );
+        }
+
+        Ok(all_ready)
     }
 
     /// Broadcast presignature join request to all participant nodes (SORUN #19 FIX)

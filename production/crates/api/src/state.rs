@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, Mutex};
 use threshold_bitcoin::BitcoinClient;
 use threshold_orchestrator::{DkgService, AuxInfoService, PresignatureService, MessageRouter};
 use threshold_storage::{EtcdStorage, PostgresStorage};
-use threshold_types::VoteRequest;
+use threshold_types::{NodeId, VoteRequest};
 
 /// Shared application state passed to all handlers
 #[derive(Clone)]
@@ -26,6 +26,8 @@ pub struct AppState {
     pub message_router: Arc<MessageRouter>,
     /// Channel to trigger automatic voting
     pub vote_trigger: mpsc::Sender<VoteRequest>,
+    /// This node's ID
+    pub node_id: NodeId,
 }
 
 impl AppState {
@@ -39,6 +41,7 @@ impl AppState {
         presig_service: Arc<PresignatureService>,
         message_router: Arc<MessageRouter>,
         vote_trigger: mpsc::Sender<VoteRequest>,
+        node_id: NodeId,
     ) -> Self {
         Self {
             postgres: Arc::new(postgres),
@@ -49,6 +52,7 @@ impl AppState {
             presig_service,
             message_router,
             vote_trigger,
+            node_id,
         }
     }
 }

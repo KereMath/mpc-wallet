@@ -3,7 +3,8 @@
 //! This module provides reusable Stream/Sink adapters for running CGGMP24 protocols
 //! over HTTP relay networking.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -13,7 +14,17 @@ use futures::sink::Sink;
 use futures::stream::Stream;
 use pin_project_lite::pin_project;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tracing::{warn, error};
+use tracing::{warn, debug};
+
+/// Compute a hash of the payload for content-based deduplication
+/// This catches duplicates even if they have different sequence numbers
+fn hash_payload(sender: u16, payload: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    sender.hash(&mut hasher);
+    payload.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Network message wrapper for MPC protocols
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,8 +120,11 @@ impl ChannelDelivery {
             receiver: self.incoming_rx,
             session_id: self.session_id.clone(),
             party_to_signer: self.party_to_signer.clone(),
-            // DEDUPLICATION: Initialize empty set to track seen messages
-            seen_messages: std::collections::HashSet::new(),
+            // CONTENT-BASED DEDUPLICATION: Track payload hashes to catch duplicates
+            // even when they have different sequence numbers (network retries)
+            seen_payload_hashes: HashSet::new(),
+            // LOCAL counter for unique message IDs (starts at 0)
+            msg_id_counter: 0,
             _phantom: PhantomData,
         };
         let outgoing = OutgoingSink {
@@ -128,16 +142,20 @@ impl ChannelDelivery {
 pin_project! {
     /// Stream adapter for incoming protocol messages
     ///
-    /// CRITICAL FIX: Includes message deduplication to prevent AttemptToOverwriteReceivedMsg errors.
-    /// Messages are tracked by (sender, seq) pairs and duplicates are silently dropped.
+    /// CRITICAL FIX: Includes content-based message deduplication to prevent
+    /// AttemptToOverwriteReceivedMsg errors. Messages are tracked by payload hash
+    /// to catch duplicates even if they have different sequence numbers.
     pub struct IncomingStream<M> {
         #[pin]
         receiver: Receiver<ProtocolMessage>,
         session_id: String,
         // Maps party_index -> signer_index for incoming messages
         party_to_signer: Option<HashMap<u16, u16>>,
-        // DEDUPLICATION: Track seen messages by (sender, seq) to prevent duplicates
-        seen_messages: std::collections::HashSet<(u16, u64)>,
+        // CONTENT-BASED DEDUPLICATION: Track seen messages by hash(sender + payload)
+        // This catches duplicates even with different seq numbers (network retries)
+        seen_payload_hashes: HashSet<u64>,
+        // LOCAL message ID counter - MUST be unique across all received messages
+        msg_id_counter: u64,
         _phantom: PhantomData<M>,
     }
 }
@@ -160,16 +178,23 @@ impl<M: DeserializeOwned> Stream for IncomingStream<M> {
                     return Poll::Pending;
                 }
 
-                // DEDUPLICATION: Check if we've already seen this (sender, seq) pair
-                // This prevents AttemptToOverwriteReceivedMsg errors from duplicate messages
-                let dedup_key = (msg.sender, msg.seq);
-                if this.seen_messages.contains(&dedup_key) {
-                    // Silently drop duplicate message
+                // CONTENT-BASED DEDUPLICATION: Hash the payload to catch duplicates
+                // even when they arrive with different sequence numbers (network retries)
+                let payload_hash = hash_payload(msg.sender, &msg.payload);
+                if !this.seen_payload_hashes.insert(payload_hash) {
+                    // Already seen this exact message content - drop silently
+                    warn!(
+                        "🚫 RUNNER DROPPING DUPLICATE: sender={}, hash={}, seq={}, payload_len={}",
+                        msg.sender, payload_hash, msg.seq, msg.payload.len()
+                    );
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
-                // Mark this message as seen
-                this.seen_messages.insert(dedup_key);
+
+                warn!(
+                    "✅ RUNNER PASSING MSG: sender={}, hash={}, seq={}, round={}, payload_len={}",
+                    msg.sender, payload_hash, msg.seq, msg.round, msg.payload.len()
+                );
 
                 // Convert sender from party_index to signer_index if mapping exists
                 let sender = if let Some(mapping) = this.party_to_signer {
@@ -197,8 +222,14 @@ impl<M: DeserializeOwned> Stream for IncomingStream<M> {
                             round_based::MessageType::P2P
                         };
 
+                        // CRITICAL FIX: Use local counter for message ID, NOT msg.seq
+                        // Different senders have overlapping sequence numbers (0, 1, 2...)
+                        // but round_based expects globally unique IDs
+                        let msg_id = *this.msg_id_counter;
+                        *this.msg_id_counter += 1;
+
                         let incoming = round_based::Incoming {
-                            id: msg.seq,
+                            id: msg_id,
                             sender, // Use converted signer_index
                             msg_type,
                             msg: protocol_msg,

@@ -44,6 +44,8 @@ services:
       - ../crates:/build/crates:ro
       # Override with local certs for development
       - ../certs:/certs:ro
+      # Primes for CGGMP24 aux_info generation
+      - ../data/primes-party-0.json:/data/primes-party-0.json:ro
     command: ["/app/mpc-wallet-server"]
 
   node-2:
@@ -56,6 +58,8 @@ services:
     volumes:
       - ../crates:/build/crates:ro
       - ../certs:/certs:ro
+      # Primes for CGGMP24 aux_info generation
+      - ../data/primes-party-1.json:/data/primes-party-1.json:ro
     command: ["/app/mpc-wallet-server"]
 
   node-3:
@@ -68,6 +72,8 @@ services:
     volumes:
       - ../crates:/build/crates:ro
       - ../certs:/certs:ro
+      # Primes for CGGMP24 aux_info generation
+      - ../data/primes-party-2.json:/data/primes-party-2.json:ro
     command: ["/app/mpc-wallet-server"]
 
   node-4:
@@ -80,6 +86,8 @@ services:
     volumes:
       - ../crates:/build/crates:ro
       - ../certs:/certs:ro
+      # Primes for CGGMP24 aux_info generation
+      - ../data/primes-party-3.json:/data/primes-party-3.json:ro
     command: ["/app/mpc-wallet-server"]
 
   node-5:
@@ -92,4 +100,6 @@ services:
     volumes:
       - ../crates:/build/crates:ro
       - ../certs:/certs:ro
+      # Primes for CGGMP24 aux_info generation
+      - ../data/primes-party-4.json:/data/primes-party-4.json:ro
     command: ["/app/mpc-wallet-server"]

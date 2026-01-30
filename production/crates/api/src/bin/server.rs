@@ -198,6 +198,7 @@ async fn main() -> Result<()> {
         Arc::clone(&presig_service),
         Arc::clone(&message_router),
         vote_tx,
+        threshold_types::NodeId(config.node_id),
     );
 
     // Parse listen address
